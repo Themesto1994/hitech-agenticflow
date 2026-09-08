@@ -227,9 +227,8 @@ jobs:
           echo "=== .context/ ===" && find .context 2>/dev/null || echo "(not found)"
           echo "=== .testmuai/ ===" && find .testmuai 2>/dev/null || echo "(not found)"
  
-      # design tests: --use-case <temp_ref> is required — loop through all use-cases
-      # proposal.json structure: { "use_cases": [{ "temp_ref": "n1", ... }, ...] }
-      # The temp_ref (e.g. "n1", "n2") is the ID passed to --use-case
+      # design tests: after context review, kane-cli assigns live IDs uc-1, uc-2, ... uc-N
+      # We count use_cases in proposal.json to know N, then loop uc-1 through uc-N
       - name: "design tests — Generate ACs, scenarios, *_test.md files"
         run: |
           # Find proposal.json — stored at .context/proposals/<timestamp>-<name>/proposal.json
@@ -242,25 +241,26 @@ jobs:
  
           echo "Using proposal: $proposal"
  
-          # Extract temp_ref values from use_cases array
-          ids=$(jq -r '.use_cases[].temp_ref' "$proposal" 2>/dev/null)
+          # Count how many use-cases were extracted — live IDs are uc-1 .. uc-N
+          count=$(jq '.use_cases | length' "$proposal" 2>/dev/null)
  
-          if [ -z "$ids" ]; then
-            echo "::error::No temp_ref IDs found in $proposal. Dumping file structure for debug:"
-            jq 'keys' "$proposal" 2>/dev/null || cat "$proposal" | head -30
+          if [ -z "$count" ] || [ "$count" -eq 0 ]; then
+            echo "::error::No use-cases found in proposal.json"
             exit 1
           fi
  
-          echo "Found use-case refs:"
-          echo "$ids"
+          echo "Designing tests for $count use-case(s): uc-1 through uc-$count"
+ 
+          # Install updated skill if available (suppress prompt)
+          kane-cli install skill 2>/dev/null || true
  
           failed=0
-          while IFS= read -r uc_id; do
-            [ -z "$uc_id" ] && continue
+          for i in $(seq 1 "$count"); do
+            uc_id="uc-$i"
             echo "─── Designing tests for use-case: $uc_id"
             kane-cli design tests --use-case "$uc_id" --mode ci \
               || { echo "::warning::design failed for use-case: $uc_id"; failed=$((failed+1)); }
-          done <<< "$ids"
+          done
  
           [ "$failed" -gt 0 ] && echo "::warning::$failed use-case(s) failed design step."
  
