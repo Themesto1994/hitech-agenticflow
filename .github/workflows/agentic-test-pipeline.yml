@@ -1,25 +1,25 @@
 name: Agentic Test Pipeline
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  One loop, from requirement to proof  (TestMu AI Assurance)             ║
-# ║                                                                          ║
-# ║   Phase 1 ─ CONTEXT   kane-cli context ingest/extract/review            ║
-# ║   Phase 2 ─ DESIGN    kane-cli design tests                             ║
-# ║   Phase 3 ─ RUN       kane-cli testmd run + testrun run                 ║
-# ║   Phase 4 ─ COVER     kane-cli cover                                    ║
-# ║   Phase 5 ─ EVIDENCE  kane-cli evidence validate + merge                ║
-# ║   Phase 6 ─ MAINTAIN  kane-cli maintain                                 ║
+# ║ One loop, from requirement to proof (TestMu AI Assurance) ║
+# ║ ║
+# ║ Phase 1 ─ CONTEXT kane-cli context ingest/extract/review ║
+# ║ Phase 2 ─ DESIGN kane-cli design tests ║
+# ║ Phase 3 ─ RUN kane-cli testmd run + testrun run ║
+# ║ Phase 4 ─ COVER kane-cli cover ║
+# ║ Phase 5 ─ EVIDENCE kane-cli evidence validate + merge ║
+# ║ Phase 6 ─ MAINTAIN kane-cli maintain ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 #
 # NOTE ON --agent FLAG:
-#   --agent outputs structured NDJSON and is only supported by RUN commands:
-#     kane-cli testmd run  →  supported  ✅
-#     kane-cli testrun run →  supported  ✅
-#   All other assurance commands (ingest, extract, review, design, cover,
-#   evidence, maintain) do NOT support --agent and will error if passed it.
+# --agent outputs structured NDJSON and is only supported by RUN commands:
+# kane-cli testmd run → supported ✅
+# kane-cli testrun run → supported ✅
+# All other assurance commands (ingest, extract, review, design, cover,
+# evidence, maintain) do NOT support --agent and will error if passed it.
 #
 # Required secrets:
-#   KANE_USERNAME / KANE_ACCESS_KEY  — TestMu credentials
-#   LT_USERNAME   / LT_ACCESS_KEY   — LambdaTest credentials
+# KANE_USERNAME / KANE_ACCESS_KEY — TestMu credentials
+# LT_USERNAME / LT_ACCESS_KEY — LambdaTest credentials
  
 on:
   workflow_dispatch:
@@ -91,9 +91,9 @@ on:
  
 jobs:
  
-  # ══════════════════════════════════════════════════════════════════════════
-  # PHASE 1 — CONTEXT
-  # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# PHASE 1 — CONTEXT
+# ══════════════════════════════════════════════════════════════════════════
   context:
     name: "Phase 1 — Context: Ingest the PRD"
     runs-on: ubuntu-latest
@@ -114,7 +114,7 @@ jobs:
           set -e
           args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
+          [ -n "${{ inputs.kane_folder_id }}" ] && args+=(--folder-id "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
  
       - name: Resolve requirements document
@@ -124,8 +124,8 @@ jobs:
           if [ -z "$doc" ]; then
             doc=$(find . -maxdepth 2 \( -iname '*.pdf' -o -iname '*.docx' \) | head -n1)
           fi
-          [ -z "$doc" ]   && { echo "::error::No requirements doc found."; exit 1; }
-          [ ! -f "$doc" ] && { echo "::error::'$doc' not found in repo.";  exit 1; }
+          [ -z "$doc" ] && { echo "::error::No requirements doc found."; exit 1; }
+          [ ! -f "$doc" ] && { echo "::error::'$doc' not found in repo."; exit 1; }
           echo "doc=$doc" >> "$GITHUB_OUTPUT"
           echo "Using: $doc"
  
@@ -146,9 +146,9 @@ jobs:
           proposal=$(find .context/proposals -name 'proposal.json' | head -n1)
           if [ -n "$proposal" ]; then
             # Try array-of-objects shape first, then single-object shape
-            jq '[.[] | {id: .id, verdict: "approve"}]' "$proposal" > verdicts.json 2>/dev/null \
-              || jq '[{id: .id, verdict: "approve"}]' "$proposal" > verdicts.json 2>/dev/null \
-              || true
+            jq '[.[] | {ref: (.slug // .cid // .id), resolution: "approved"}]' "$proposal" > verdicts.json 2>/dev/null \
+            || jq '[{ref: (.slug // .cid // .id), resolution: "approved"}]' "$proposal" > verdicts.json 2>/dev/null \
+            || true
             if [ -f verdicts.json ] && [ -s verdicts.json ]; then
               kane-cli context review --verdicts verdicts.json || true
             else
@@ -171,6 +171,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: context-store
+          include-hidden-files: true
           # Use directory paths (no /**) — upload-artifact@v4 recurses into them
           # and correctly handles hidden dot-directories like .context/ and .testmuai/
           path: |
@@ -191,9 +192,9 @@ jobs:
             echo "| Review | \`kane-cli context review\` |"
           } >> "$GITHUB_STEP_SUMMARY"
  
-  # ══════════════════════════════════════════════════════════════════════════
-  # PHASE 2 — DESIGN
-  # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# PHASE 2 — DESIGN
+# ══════════════════════════════════════════════════════════════════════════
   design:
     name: "Phase 2 — Design: ACs to Tests"
     needs: context
@@ -217,7 +218,7 @@ jobs:
           set -e
           args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
+          [ -n "${{ inputs.kane_folder_id }}" ] && args+=(--folder-id "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
  
       - name: Debug — verify context data restored
@@ -233,6 +234,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: designed-tests
+          include-hidden-files: true
           # Use directory paths (no /**) — same fix as Phase 1 upload
           path: |
             .context
@@ -248,10 +250,10 @@ jobs:
             echo "**Tests designed:** $test_count \`*_test.md\` file(s)"
           } >> "$GITHUB_STEP_SUMMARY"
  
-  # ══════════════════════════════════════════════════════════════════════════
-  # PHASE 3 — RUN
-  # testmd run and testrun run DO support --agent (they are run commands)
-  # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# PHASE 3 — RUN
+# testmd run and testrun run DO support --agent (they are run commands)
+# ══════════════════════════════════════════════════════════════════════════
   run:
     name: "Phase 3 — Run: Author, Replay"
     needs: design
@@ -274,7 +276,7 @@ jobs:
           set -e
           args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
+          [ -n "${{ inputs.kane_folder_id }}" ] && args+=(--folder-id "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
  
       - name: Set default start URL
@@ -366,10 +368,10 @@ jobs:
             echo "**Evidence packs:** ${{ steps.collect.outputs.pack_count }}"
           } >> "$GITHUB_STEP_SUMMARY"
  
-  # ══════════════════════════════════════════════════════════════════════════
-  # PHASE 4 — COVER
-  # cover does NOT support --agent
-  # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# PHASE 4 — COVER
+# cover does NOT support --agent
+# ══════════════════════════════════════════════════════════════════════════
   cover:
     name: "Phase 4 — Cover: Prove and Gate"
     needs: run
@@ -397,7 +399,7 @@ jobs:
           set -e
           args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
+          [ -n "${{ inputs.kane_folder_id }}" ] && args+=(--folder-id "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
  
       - name: Copy evidence packs
@@ -432,10 +434,10 @@ jobs:
             [ -f coverage_output.txt ] && { echo '```'; cat coverage_output.txt; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
  
-  # ══════════════════════════════════════════════════════════════════════════
-  # PHASE 5 — EVIDENCE
-  # evidence validate and evidence merge do NOT support --agent
-  # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# PHASE 5 — EVIDENCE
+# evidence validate and evidence merge do NOT support --agent
+# ══════════════════════════════════════════════════════════════════════════
   evidence:
     name: "Phase 5 — Evidence: The Proof"
     needs: cover
@@ -459,7 +461,7 @@ jobs:
           set -e
           args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
+          [ -n "${{ inputs.kane_folder_id }}" ] && args+=(--folder-id "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
  
       - name: Copy evidence packs
@@ -525,10 +527,10 @@ jobs:
             [ -f validation_log.txt ] && { echo '```'; cat validation_log.txt; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
  
-  # ══════════════════════════════════════════════════════════════════════════
-  # PHASE 6 — MAINTAIN
-  # maintain does NOT support --agent
-  # ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# PHASE 6 — MAINTAIN
+# maintain does NOT support --agent
+# ══════════════════════════════════════════════════════════════════════════
   maintain:
     name: "Phase 6 — Maintain: Reconcile Change"
     needs: evidence
@@ -552,7 +554,7 @@ jobs:
           set -e
           args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
+          [ -n "${{ inputs.kane_folder_id }}" ] && args+=(--folder-id "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
  
       # maintain: requires --mode ci when no TTY (CI environment)
