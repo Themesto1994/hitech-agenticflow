@@ -143,13 +143,14 @@ jobs:
       # avoids --list-ids which also requires a TTY.
       - name: "context review — Auto-approve all use-cases in CI"
         run: |
+          # proposal.json lives at .context/proposals/<timestamp>-<name>/proposal.json
+          # use_cases[].temp_ref is the ref field for verdicts
           proposal=$(find .context/proposals -name 'proposal.json' | head -n1)
           if [ -n "$proposal" ]; then
-            # Try array-of-objects shape first, then single-object shape
-            jq '[.[] | {ref: (.slug // .cid // .id), resolution: "approved"}]' "$proposal" > verdicts.json 2>/dev/null \
-            || jq '[{ref: (.slug // .cid // .id), resolution: "approved"}]' "$proposal" > verdicts.json 2>/dev/null \
-            || true
+            jq '[.use_cases[] | {ref: .temp_ref, resolution: "approved"}]' "$proposal" > verdicts.json 2>/dev/null || true
             if [ -f verdicts.json ] && [ -s verdicts.json ]; then
+              echo "Submitting verdicts:"
+              cat verdicts.json
               kane-cli context review --verdicts verdicts.json || true
             else
               echo "::warning::Could not build verdicts from proposal.json; skipping review."
@@ -226,36 +227,31 @@ jobs:
           echo "=== .context/ ===" && find .context 2>/dev/null || echo "(not found)"
           echo "=== .testmuai/ ===" && find .testmuai 2>/dev/null || echo "(not found)"
  
-      # design tests: --use-case <id> is required — loop through all extracted use-cases
+      # design tests: --use-case <temp_ref> is required — loop through all use-cases
+      # proposal.json structure: { "use_cases": [{ "temp_ref": "n1", ... }, ...] }
+      # The temp_ref (e.g. "n1", "n2") is the ID passed to --use-case
       - name: "design tests — Generate ACs, scenarios, *_test.md files"
         run: |
-          ids=""
+          # Find proposal.json — stored at .context/proposals/<timestamp>-<name>/proposal.json
+          proposal=$(find .context/proposals -name 'proposal.json' 2>/dev/null | head -n1)
  
-          # Try use-cases.json first (most explicit source)
-          uc_list=$(find .context -name 'use-cases.json' 2>/dev/null | head -n1)
-          if [ -n "$uc_list" ]; then
-            ids=$(jq -r '.[] | (.id // .slug // .cid) | select(. != null)' "$uc_list" 2>/dev/null)
-          fi
- 
-          # Fallback: try proposal.json in .context/proposals/
-          if [ -z "$ids" ]; then
-            proposal=$(find .context -name 'proposal.json' 2>/dev/null | head -n1)
-            if [ -n "$proposal" ]; then
-              ids=$(jq -r 'if type=="array" then .[]|(.slug//.cid//.id) else (.slug//.cid//.id) end | select(.!=null)' "$proposal" 2>/dev/null)
-            fi
-          fi
- 
-          # Fallback: try any .uc files (use filename as ID)
-          if [ -z "$ids" ]; then
-            ids=$(find .context -name '*.uc' 2>/dev/null | xargs -I{} basename {} .uc)
-          fi
- 
-          if [ -z "$ids" ]; then
-            echo "::error::No use-case IDs found in context store. Check Phase 1 debug output."
+          if [ -z "$proposal" ]; then
+            echo "::error::No proposal.json found under .context/proposals/. Check Phase 1 debug output."
             exit 1
           fi
  
-          echo "Found use-cases:"
+          echo "Using proposal: $proposal"
+ 
+          # Extract temp_ref values from use_cases array
+          ids=$(jq -r '.use_cases[].temp_ref' "$proposal" 2>/dev/null)
+ 
+          if [ -z "$ids" ]; then
+            echo "::error::No temp_ref IDs found in $proposal. Dumping file structure for debug:"
+            jq 'keys' "$proposal" 2>/dev/null || cat "$proposal" | head -30
+            exit 1
+          fi
+ 
+          echo "Found use-case refs:"
           echo "$ids"
  
           failed=0
@@ -610,4 +606,3 @@ jobs:
             echo "---"
             echo "### ✅ Pipeline Complete — ready to restart from Phase 1"
           } >> "$GITHUB_STEP_SUMMARY"
- 
