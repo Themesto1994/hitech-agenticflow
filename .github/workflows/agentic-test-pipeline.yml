@@ -143,20 +143,19 @@ jobs:
       # avoids --list-ids which also requires a TTY.
       - name: "context review — Auto-approve all use-cases in CI"
         run: |
-          # proposal.json lives at .context/proposals/<timestamp>-<name>/proposal.json
-          # use_cases[].temp_ref is the ref field for verdicts
-          proposal=$(find .context/proposals -name 'proposal.json' | head -n1)
+          # After context extract, kane-cli assigns uc-1, uc-2, ... uc-N as live IDs.
+          # Count use_cases from proposal.json and approve each with --approve uc-N directly.
+          proposal=$(find .context/proposals -name 'proposal.json' 2>/dev/null | head -n1)
           if [ -n "$proposal" ]; then
-            jq '[.use_cases[] | {ref: .temp_ref, resolution: "approved"}]' "$proposal" > verdicts.json 2>/dev/null || true
-            if [ -f verdicts.json ] && [ -s verdicts.json ]; then
-              echo "Submitting verdicts:"
-              cat verdicts.json
-              kane-cli context review --verdicts verdicts.json || true
-            else
-              echo "::warning::Could not build verdicts from proposal.json; skipping review."
-            fi
+            count=$(jq '.use_cases | length' "$proposal" 2>/dev/null)
+            echo "Approving $count use-case(s)..."
+            for i in $(seq 1 "$count"); do
+              echo "  Approving uc-$i"
+              kane-cli context review --approve "uc-$i" 2>/dev/null || \
+                echo "::warning::Could not approve uc-$i (may already be approved)"
+            done
           else
-            echo "::warning::No proposal.json found in .context/proposals/; skipping review."
+            echo "::warning::No proposal.json found; skipping review."
           fi
  
       - name: Debug — show where kane-cli stored context data
@@ -258,7 +257,7 @@ jobs:
           for i in $(seq 1 "$count"); do
             uc_id="uc-$i"
             echo "─── Designing tests for use-case: $uc_id"
-            kane-cli design tests --use-case "$uc_id" --mode ci \
+            kane-cli design tests --use-case "$uc_id" --allow-unreviewed --mode ci \
               || { echo "::warning::design failed for use-case: $uc_id"; failed=$((failed+1)); }
           done
  
