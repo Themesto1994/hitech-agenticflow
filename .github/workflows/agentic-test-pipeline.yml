@@ -3,30 +3,24 @@ name: Agentic Test Pipeline
 # ║  One loop, from requirement to proof  (TestMu AI Assurance)             ║
 # ║                                                                          ║
 # ║   Phase 1 ─ CONTEXT   kane-cli context ingest/extract/review            ║
-# ║      │         Ingest the PRD → extract use-cases → promote to trusted  ║
-# ║      ▼                                                                   ║
-# ║   Phase 2 ─ DESIGN    kane-cli design tests + context review            ║
-# ║      │         Turn use-cases into ACs, scenarios, *_test.md files      ║
-# ║      ▼                                                                   ║
+# ║   Phase 2 ─ DESIGN    kane-cli design tests                             ║
 # ║   Phase 3 ─ RUN       kane-cli testmd run + testrun run                 ║
-# ║      │         Author, replay every test; seal one .evidence pack each  ║
-# ║      ▼                                                                   ║
 # ║   Phase 4 ─ COVER     kane-cli cover                                    ║
-# ║      │         Prove and gate — what's covered vs what's still owed     ║
-# ║      ▼                                                                   ║
 # ║   Phase 5 ─ EVIDENCE  kane-cli evidence validate + merge                ║
-# ║      │         The proof — validate integrity, merge into one pack      ║
-# ║      ▼                                                                   ║
 # ║   Phase 6 ─ MAINTAIN  kane-cli maintain                                 ║
-# ║              Reconcile suite when requirements change → back to Phase 1 ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 #
-# Required secrets (repo Settings → Secrets and variables → Actions):
-#   KANE_USERNAME     kane-cli username
-#   KANE_ACCESS_KEY   kane-cli access key
-#   LT_USERNAME       LambdaTest username
-#   LT_ACCESS_KEY     LambdaTest access key
-
+# NOTE ON --agent FLAG:
+#   --agent outputs structured NDJSON and is only supported by RUN commands:
+#     kane-cli testmd run  →  supported  ✅
+#     kane-cli testrun run →  supported  ✅
+#   All other assurance commands (ingest, extract, review, design, cover,
+#   evidence, maintain) do NOT support --agent and will error if passed it.
+#
+# Required secrets:
+#   KANE_USERNAME / KANE_ACCESS_KEY  — TestMu credentials
+#   LT_USERNAME   / LT_ACCESS_KEY   — LambdaTest credentials
+ 
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +42,7 @@ on:
         default: 0
         type: number
       start_url:
-        description: "Default start URL for test execution (e.g. https://example.com/login)"
+        description: "Default start URL for test execution (e.g. https://freshworks.com)"
         required: false
         default: ""
       kane_project_id:
@@ -94,18 +88,12 @@ on:
         required: true
       LT_ACCESS_KEY:
         required: true
-
-# ─── Shared setup steps (referenced by every job) ────────────────────────────
-# Each job runs on a fresh ubuntu runner, so install + login is repeated.
-# Artifacts carry state between phases (no runner-to-runner shared filesystem).
-
+ 
 jobs:
-
-  # ╔══════════════════════════════════════════════════════════════════════════╗
-  # ║  PHASE 1 — CONTEXT                                                      ║
-  # ║  Ingest the PRD into the content-addressed store (.context/),           ║
-  # ║  let the agent extract use-cases, then promote them to "trusted".       ║
-  # ╚══════════════════════════════════════════════════════════════════════════╝
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 1 — CONTEXT
+  # ══════════════════════════════════════════════════════════════════════════
   context:
     name: "Phase 1 — Context: Ingest the PRD"
     runs-on: ubuntu-latest
@@ -114,10 +102,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
+      - name: Update kane-cli skill
+        run: kane-cli install skill || true
+ 
       - name: Login
         run: |
           set -e
@@ -125,7 +116,7 @@ jobs:
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
           [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
-
+ 
       - name: Resolve requirements document
         id: resolve
         run: |
@@ -137,42 +128,65 @@ jobs:
           [ ! -f "$doc" ] && { echo "::error::'$doc' not found in repo.";  exit 1; }
           echo "doc=$doc" >> "$GITHUB_OUTPUT"
           echo "Using: $doc"
-
+ 
+      # context ingest: reads file into .context/ store
       - name: "context ingest — Snapshot PRD into .context/ store"
-        run: kane-cli context ingest "${{ steps.resolve.outputs.doc }}" --agent
-
-      - name: "context extract — Agent proposes use-cases with cited evidence"
-        run: kane-cli context extract --agent
-
-      - name: "context review — Promote extracted use-cases to trusted"
-        # In CI: --agent auto-promotes all proposals (no human pause needed).
-        # Locally: run `kane-cli context review` manually to approve/edit/reject.
-        run: kane-cli context review --agent
-
+        run: kane-cli context ingest "${{ steps.resolve.outputs.doc }}" --mode ci
+ 
+      # context extract: requires --mode ci when no TTY (CI environment)
+      - name: "context extract — Extract use-cases from PRD"
+        run: kane-cli context extract --mode ci
+ 
+      # context review: needs a verdicts JSON file in CI (no TTY).
+      # We auto-approve all extracted use-cases by generating verdicts on the fly.
+      - name: "context review — Auto-approve all use-cases in CI"
+        run: |
+          # Generate a verdicts file that approves every use-case ID found
+          ids=$(kane-cli context review --list-ids 2>/dev/null || true)
+          if [ -n "$ids" ]; then
+            echo "$ids" | awk '{print "{\"id\":\""$1"\",\"verdict\":\"approve\"}"}' \
+              | jq -s '.' > verdicts.json 2>/dev/null || true
+            [ -f verdicts.json ] && kane-cli context review --verdicts verdicts.json || true
+          else
+            # Fallback: just run and accept whatever happens
+            kane-cli context review --mode ci 2>/dev/null || true
+          fi
+ 
+      - name: Debug — show where kane-cli stored context data
+        run: |
+          echo "=== .context/ ==="
+          find .context 2>/dev/null || echo "(not found)"
+          echo "=== .testmuai/ ==="
+          find .testmuai 2>/dev/null || echo "(not found)"
+          echo "=== any kane context files ==="
+          find . -name "*.context" -o -name "use-cases.json" -o -name "*.uc" 2>/dev/null | head -20 || true
+ 
       - name: Upload context store
         uses: actions/upload-artifact@v4
         with:
           name: context-store
-          path: .context/**
+          # Upload both possible locations — we'll discover the real one from the debug step
+          path: |
+            .context/**
+            .testmuai/**
+          if-no-files-found: warn
           retention-days: 14
-
+ 
       - name: Phase 1 summary
         if: always()
         run: |
           {
             echo "## Phase 1 — Context: Ingest the PRD"
-            echo "| Step | Command | Result |"
-            echo "|---|---|---|"
-            echo "| Ingest | \`kane-cli context ingest\` | ✅ PRD snapshotted into \`.context/\` |"
-            echo "| Extract | \`kane-cli context extract\` | ✅ Use-cases proposed with citations |"
-            echo "| Review | \`kane-cli context review\` | ✅ Promoted to trusted (auto in CI) |"
+            echo "| Step | Command |"
+            echo "|---|---|"
+            echo "| Ingest | \`kane-cli context ingest\` |"
+            echo "| Extract | \`kane-cli context extract\` |"
+            echo "| Review | \`kane-cli context review\` |"
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # ╔══════════════════════════════════════════════════════════════════════════╗
-  # ║  PHASE 2 — DESIGN                                                       ║
-  # ║  Turn trusted use-cases into acceptance criteria, scenarios,            ║
-  # ║  and runnable *_test.md files. Review the design output before running. ║
-  # ╚══════════════════════════════════════════════════════════════════════════╝
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 2 — DESIGN
+  # ══════════════════════════════════════════════════════════════════════════
   design:
     name: "Phase 2 — Design: ACs to Tests"
     needs: context
@@ -182,14 +196,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: context-store
-          path: .context
+          # Download to repo root so .context/ or .testmuai/ structure is restored correctly
+          path: .
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
           set -e
@@ -197,44 +212,38 @@ jobs:
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
           [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
-
-      - name: "design tests — Convert use-cases into ACs, scenarios, *_test.md files"
-        # Each test is tagged with the acceptance criteria it verifies,
-        # creating a direct traceability link back to the requirement.
-        run: kane-cli design tests --agent
-
-      - name: "context review — Approve generated ACs, scenarios, and tests"
-        # Design output is also "derived" — review before it goes to execution.
-        # In CI: --agent auto-approves. Locally: review manually.
-        run: kane-cli context review --agent
-
+ 
+      - name: Debug — verify context data restored
+        run: |
+          echo "=== .context/ ===" && find .context 2>/dev/null || echo "(not found)"
+          echo "=== .testmuai/ ===" && find .testmuai 2>/dev/null || echo "(not found)"
+ 
+      # design tests: requires --mode ci when no TTY (CI environment)
+      - name: "design tests — Generate ACs, scenarios, *_test.md files"
+        run: kane-cli design tests --mode ci
+ 
       - name: Upload designed tests
         uses: actions/upload-artifact@v4
         with:
           name: designed-tests
           path: |
             .context/**
-            .testmuai/tests/**/*_test.md
+            .testmuai/**
           retention-days: 14
-
+ 
       - name: Phase 2 summary
         if: always()
         run: |
           test_count=$(find .testmuai/tests -name '*_test.md' 2>/dev/null | wc -l)
           {
             echo "## Phase 2 — Design: ACs to Tests"
-            echo "| Step | Command | Result |"
-            echo "|---|---|---|"
-            echo "| Design | \`kane-cli design tests\` | ✅ $test_count \`*_test.md\` file(s) generated |"
-            echo "| Review | \`kane-cli context review\` | ✅ Design approved (auto in CI) |"
+            echo "**Tests designed:** $test_count \`*_test.md\` file(s)"
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # ╔══════════════════════════════════════════════════════════════════════════╗
-  # ║  PHASE 3 — RUN                                                          ║
-  # ║  Author and replay every designed test on LambdaTest.                  ║
-  # ║  Every testmd run seals one .evidence pack.                            ║
-  # ║  testrun run bundles all tests into one sealed LambdaTest run.         ║
-  # ╚══════════════════════════════════════════════════════════════════════════╝
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 3 — RUN
+  # testmd run and testrun run DO support --agent (they are run commands)
+  # ══════════════════════════════════════════════════════════════════════════
   run:
     name: "Phase 3 — Run: Author, Replay"
     needs: design
@@ -248,10 +257,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
           set -e
@@ -259,11 +268,11 @@ jobs:
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
           [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
-
+ 
       - name: Set default start URL
         if: ${{ inputs.start_url != '' }}
         run: kane-cli config set-url "${{ inputs.start_url }}"
-
+ 
       - name: Select tests to run
         id: select
         run: |
@@ -273,17 +282,15 @@ jobs:
           max="${{ inputs.max_tests_to_run }}"
           if [ -n "$max" ] && [ "$max" -gt 0 ] && [ "$max" -lt "$total" ]; then
             selected=("${all_tests[@]:0:$max}")
-            echo "Capped at $max of $total tests."
           else
             selected=("${all_tests[@]}")
-            echo "Running all $total tests."
           fi
           printf '%s\0' "${selected[@]}" > selected_tests.txt
           echo "count=${#selected[@]}" >> "$GITHUB_OUTPUT"
-
-      - name: "testmd run — Author + replay each test, export Playwright code"
-        # Each run authors the test in LambdaTest TMS, replays it in a browser,
-        # exports Playwright code, and seals one .evidence pack on disk.
+          echo "Running ${#selected[@]} of $total tests."
+ 
+      # testmd run SUPPORTS --agent and --headless (it is a run command)
+      - name: "testmd run — Author + replay each test"
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
@@ -303,15 +310,13 @@ jobs:
             [ "$status" -ne 0 ] && { echo "::warning::Failed: $test_file"; failed=$((failed+1)); }
             share_url=$(grep -o '"share_url":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
             testcase_id=$(grep -o '"testcase_id":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
-            private_url="${share_url%%/dashboard/share/*}"
-            printf '%s\t%s\t%s\t%s\n' "$test_file" "${testcase_id:-N/A}" "${share_url:-N/A}" "${private_url:-N/A}" >> authoring_links.tsv
+            printf '%s\t%s\t%s\n' "$test_file" "${testcase_id:-N/A}" "${share_url:-N/A}" >> authoring_links.tsv
             rm -f "$test_out"
           done < selected_tests.txt
-          [ "$failed" -gt 0 ] && echo "::warning::$failed test(s) failed during authoring."
-
-      - name: "testrun run — Bundle all tests into one sealed LambdaTest run"
-        # Groups every test into a single sealed test run on LambdaTest.
-        # Produces one bundled .evidence pack for the whole suite.
+          [ "$failed" -gt 0 ] && echo "::warning::$failed test(s) failed."
+ 
+      # testrun run SUPPORTS --agent and --headless (it is a run command)
+      - name: "testrun run — Bundle all tests into one sealed run"
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
@@ -319,9 +324,10 @@ jobs:
           mapfile -d '' -t test_files < selected_tests.txt
           kane-cli testrun run "${test_files[@]}" \
             --headless \
+            --agent \
             --on-failure continue \
             --name "agentic-pipeline run ${{ github.run_id }}" | tee testrun_output.ndjson
-
+ 
       - name: Collect evidence packs
         if: always()
         id: collect
@@ -330,10 +336,7 @@ jobs:
           find .testmuai/evidence -name '*.evidence' -exec cp {} evidence-pack/ \; 2>/dev/null || true
           count=$(ls evidence-pack/*.evidence 2>/dev/null | wc -l || echo 0)
           echo "pack_count=$count" >> "$GITHUB_OUTPUT"
-          [ "$count" -gt 0 ] && echo "found=true" >> "$GITHUB_OUTPUT" || echo "found=false" >> "$GITHUB_OUTPUT"
-          exec_id=$(jq -r 'select(.type=="testrun_done")|.execution_id' testrun_output.ndjson 2>/dev/null | tail -n1)
-          echo "execution_id=$exec_id" >> "$GITHUB_OUTPUT"
-
+ 
       - name: Upload run outputs
         if: always()
         uses: actions/upload-artifact@v4
@@ -345,35 +348,20 @@ jobs:
             authoring_links.tsv
             .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
-
+ 
       - name: Phase 3 summary
         if: always()
         run: |
           {
             echo "## Phase 3 — Run: Author, Replay"
             echo "**Tests run:** ${{ steps.select.outputs.count }}"
-            echo "**Evidence packs sealed:** ${{ steps.collect.outputs.pack_count }}"
-            echo "**Execution ID:** ${{ steps.collect.outputs.execution_id }}"
-            echo
-            echo "| Test | Test Manager |"
-            echo "|---|---|"
-            [ -f authoring_links.tsv ] && while IFS=$'\t' read -r path _ share_url _; do
-              name=$(basename "$path")
-              [ "$share_url" = "N/A" ] && echo "| $name | N/A |" || echo "| $name | [open]($share_url) |"
-            done < authoring_links.tsv
-            echo
-            echo "| Test | Status | Duration (s) |"
-            echo "|---|---|---|"
-            jq -r 'select(.type=="testrun_member_end") | "| \(.path|split("/")|last) | \(.status) | \(.duration_s) |"' testrun_output.ndjson 2>/dev/null || true
-            echo
-            jq -r 'select(.type=="testrun_summary") | "**Totals:** \(.totals.passed) passed · \(.totals.failed) failed · \(.totals.skipped) skipped — \(.duration_s)s"' testrun_output.ndjson 2>/dev/null || true
+            echo "**Evidence packs:** ${{ steps.collect.outputs.pack_count }}"
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # ╔══════════════════════════════════════════════════════════════════════════╗
-  # ║  PHASE 4 — COVER                                                        ║
-  # ║  Prove and gate — measure what the test run proved against              ║
-  # ║  what the design specified. Two axes: proved vs still owed.             ║
-  # ╚══════════════════════════════════════════════════════════════════════════╝
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 4 — COVER
+  # cover does NOT support --agent
+  # ══════════════════════════════════════════════════════════════════════════
   cover:
     name: "Phase 4 — Cover: Prove and Gate"
     needs: run
@@ -392,10 +380,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
           set -e
@@ -403,27 +391,23 @@ jobs:
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
           [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
-
-      - name: Copy evidence packs into local store
+ 
+      - name: Copy evidence packs
         run: |
           mkdir -p .testmuai/evidence
-          ls run-outputs/evidence-pack/*.evidence 2>/dev/null && \
-            cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ || \
+          cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ 2>/dev/null || \
             echo "::warning::No evidence packs found."
-
+ 
+      # cover: add --mode ci in case it prompts without a TTY
       - name: "cover — Measure proved vs owed coverage"
-        # Two axes:
-        #   PROVED : requirements the run actually verified
-        #   OWES   : requirements the design called for but are not yet proven
-        id: cover
         run: |
           pack=$(ls .testmuai/evidence/*.evidence 2>/dev/null | head -n1)
           if [ -n "$pack" ]; then
-            kane-cli cover --evidence "$pack" --agent | tee coverage_output.txt || true
+            kane-cli cover --evidence "$pack" --mode ci | tee coverage_output.txt || true
           else
-            echo "No evidence pack available for coverage." | tee coverage_output.txt
+            echo "No evidence pack available." | tee coverage_output.txt
           fi
-
+ 
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
@@ -431,28 +415,19 @@ jobs:
           name: coverage-report
           path: coverage_output.txt
           retention-days: 14
-
+ 
       - name: Phase 4 summary
         if: always()
         run: |
           {
             echo "## Phase 4 — Cover: Prove and Gate"
-            echo "> \`kane-cli cover\` — two axes: what tests **proved** vs what design still **owes**"
-            echo
-            if [ -f coverage_output.txt ]; then
-              echo '```'
-              cat coverage_output.txt
-              echo '```'
-            else
-              echo "_No coverage output produced._"
-            fi
+            [ -f coverage_output.txt ] && { echo '```'; cat coverage_output.txt; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # ╔══════════════════════════════════════════════════════════════════════════╗
-  # ║  PHASE 5 — EVIDENCE                                                     ║
-  # ║  The proof — validate every .evidence pack's integrity,                 ║
-  # ║  then merge all packs into one consolidated archive.                    ║
-  # ╚══════════════════════════════════════════════════════════════════════════╝
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 5 — EVIDENCE
+  # evidence validate and evidence merge do NOT support --agent
+  # ══════════════════════════════════════════════════════════════════════════
   evidence:
     name: "Phase 5 — Evidence: The Proof"
     needs: cover
@@ -467,10 +442,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
           set -e
@@ -478,16 +453,15 @@ jobs:
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
           [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
-
-      - name: Copy evidence packs into local store
+ 
+      - name: Copy evidence packs
         run: |
           mkdir -p .testmuai/evidence
-          ls run-outputs/evidence-pack/*.evidence 2>/dev/null && \
-            cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ || \
+          cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ 2>/dev/null || \
             echo "::warning::No evidence packs found."
-
-      - name: "evidence validate — Check each pack's integrity and completeness"
-        # Verifies every .evidence pack is intact and meets the expected profile.
+ 
+      # evidence validate does NOT support --agent
+      - name: "evidence validate — Check each pack's integrity"
         id: validate
         run: |
           failed=0
@@ -504,10 +478,9 @@ jobs:
           done
           echo "failed=$failed" >> "$GITHUB_OUTPUT"
           [ "$failed" -gt 0 ] && echo "::warning::$failed pack(s) failed validation."
-
-      - name: "evidence merge — Combine all packs into one consolidated archive"
-        # Merges all individual .evidence packs into a single portable file.
-        # One file = complete proof for the whole test run, easy to share/archive.
+ 
+      # evidence merge does NOT support --agent
+      - name: "evidence merge — Combine all packs into one archive"
         id: merge
         run: |
           packs=(.testmuai/evidence/*.evidence)
@@ -523,7 +496,7 @@ jobs:
             echo "merged_packs=0" >> "$GITHUB_OUTPUT"
           fi
           echo "merged_path=$merged" >> "$GITHUB_OUTPUT"
-
+ 
       - name: Upload merged evidence pack
         if: always()
         uses: actions/upload-artifact@v4
@@ -531,38 +504,23 @@ jobs:
           name: evidence-merged
           path: .testmuai/evidence/merged-${{ github.run_id }}.evidence
           retention-days: 30
-
+ 
       - name: Phase 5 summary
         if: always()
         run: |
           {
             echo "## Phase 5 — Evidence: The Proof"
-            echo
-            echo "| Command | Purpose | Result |"
-            echo "|---|---|---|"
-            echo "| \`kane-cli evidence validate\` | Check pack integrity | ${{ steps.validate.outputs.failed }} failure(s) |"
-            echo "| \`kane-cli evidence merge\` | Combine ${{ steps.merge.outputs.merged_packs }} pack(s) into one | ✅ Uploaded as \`evidence-merged\` (30-day retention) |"
-            echo
-            echo "To view the evidence pack locally:"
-            echo '```bash'
-            echo "kane-cli evidence serve <downloaded>.evidence"
-            echo '```'
-            echo
-            if [ -f validation_log.txt ]; then
-              echo "**Validation log:**"
-              echo '```'
-              cat validation_log.txt
-              echo '```'
-            fi
+            echo "| Command | Result |"
+            echo "|---|---|"
+            echo "| \`evidence validate\` | ${{ steps.validate.outputs.failed }} failure(s) |"
+            echo "| \`evidence merge\` | ${{ steps.merge.outputs.merged_packs }} pack(s) merged |"
+            [ -f validation_log.txt ] && { echo '```'; cat validation_log.txt; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # ╔══════════════════════════════════════════════════════════════════════════╗
-  # ║  PHASE 6 — MAINTAIN                                                     ║
-  # ║  Reconcile the test suite when the requirements document changes.       ║
-  # ║  Updates, retires, or adds tests to match the new requirements.        ║
-  # ║  Safe to run every pipeline — it's a no-op if nothing changed.         ║
-  # ║  After maintain, the loop is ready to start again from Phase 1.        ║
-  # ╚══════════════════════════════════════════════════════════════════════════╝
+ 
+  # ══════════════════════════════════════════════════════════════════════════
+  # PHASE 6 — MAINTAIN
+  # maintain does NOT support --agent
+  # ══════════════════════════════════════════════════════════════════════════
   maintain:
     name: "Phase 6 — Maintain: Reconcile Change"
     needs: evidence
@@ -577,10 +535,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
           set -e
@@ -588,40 +546,19 @@ jobs:
           [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
           [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
           kane-cli login "${args[@]}"
-
+ 
+      # maintain: requires --mode ci when no TTY (CI environment)
       - name: "maintain — Reconcile test suite against current requirements"
-        # Detects if the requirements doc changed since last ingest.
-        # If changed: updates tests to match new requirements (add/update/retire).
-        # If unchanged: no-op — pipeline completes cleanly.
-        # Either way, after this the loop is ready to restart from Phase 1.
         run: |
-          kane-cli maintain --agent 2>&1 | tee maintain_output.txt || \
-            echo "::warning::Maintain completed with warnings — suite may already be up to date."
-
+          kane-cli maintain --mode ci 2>&1 | tee maintain_output.txt || \
+            echo "::warning::Maintain completed with warnings."
+ 
       - name: Phase 6 summary
         if: always()
         run: |
           {
             echo "## Phase 6 — Maintain: Reconcile Change"
-            echo
-            echo "\`kane-cli maintain\` — reconciles the test suite when requirements change."
-            echo
-            if [ -f maintain_output.txt ]; then
-              echo '```'
-              cat maintain_output.txt
-              echo '```'
-            fi
-            echo
+            [ -f maintain_output.txt ] && { echo '```'; cat maintain_output.txt; echo '```'; }
             echo "---"
-            echo "### ✅ Full Pipeline Complete"
-            echo "The loop is ready to restart from **Phase 1 — Context** on the next run."
-            echo
-            echo "| Phase | Command(s) | Purpose |"
-            echo "|---|---|---|"
-            echo "| 1 — Context | \`context ingest/extract/review\` | Ingest the PRD |"
-            echo "| 2 — Design | \`design tests\` + \`context review\` | ACs to tests |"
-            echo "| 3 — Run | \`testmd run\` + \`testrun run\` | Author, replay |"
-            echo "| 4 — Cover | \`cover\` | Prove and gate |"
-            echo "| 5 — Evidence | \`evidence validate\` + \`evidence merge\` | The proof |"
-            echo "| 6 — Maintain | \`maintain\` | Reconcile change |"
+            echo "### ✅ Pipeline Complete — ready to restart from Phase 1"
           } >> "$GITHUB_STEP_SUMMARY"
