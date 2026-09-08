@@ -138,18 +138,24 @@ jobs:
         run: kane-cli context extract --mode ci
  
       # context review: needs a verdicts JSON file in CI (no TTY).
-      # We auto-approve all extracted use-cases by generating verdicts on the fly.
+      # We auto-approve all extracted use-cases by reading IDs directly from
+      # the proposal.json that kane-cli writes to .context/proposals/ — this
+      # avoids --list-ids which also requires a TTY.
       - name: "context review — Auto-approve all use-cases in CI"
         run: |
-          # Generate a verdicts file that approves every use-case ID found
-          ids=$(kane-cli context review --list-ids 2>/dev/null || true)
-          if [ -n "$ids" ]; then
-            echo "$ids" | awk '{print "{\"id\":\""$1"\",\"verdict\":\"approve\"}"}' \
-              | jq -s '.' > verdicts.json 2>/dev/null || true
-            [ -f verdicts.json ] && kane-cli context review --verdicts verdicts.json || true
+          proposal=$(find .context/proposals -name 'proposal.json' | head -n1)
+          if [ -n "$proposal" ]; then
+            # Try array-of-objects shape first, then single-object shape
+            jq '[.[] | {id: .id, verdict: "approve"}]' "$proposal" > verdicts.json 2>/dev/null \
+              || jq '[{id: .id, verdict: "approve"}]' "$proposal" > verdicts.json 2>/dev/null \
+              || true
+            if [ -f verdicts.json ] && [ -s verdicts.json ]; then
+              kane-cli context review --verdicts verdicts.json || true
+            else
+              echo "::warning::Could not build verdicts from proposal.json; skipping review."
+            fi
           else
-            # Fallback: just run and accept whatever happens
-            kane-cli context review --mode ci 2>/dev/null || true
+            echo "::warning::No proposal.json found in .context/proposals/; skipping review."
           fi
  
       - name: Debug — show where kane-cli stored context data
@@ -165,10 +171,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: context-store
-          # Upload both possible locations — we'll discover the real one from the debug step
+          # Use directory paths (no /**) — upload-artifact@v4 recurses into them
+          # and correctly handles hidden dot-directories like .context/ and .testmuai/
           path: |
-            .context/**
-            .testmuai/**
+            .context
+            .testmuai
           if-no-files-found: warn
           retention-days: 14
  
@@ -226,9 +233,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: designed-tests
+          # Use directory paths (no /**) — same fix as Phase 1 upload
           path: |
-            .context/**
-            .testmuai/**
+            .context
+            .testmuai
           retention-days: 14
  
       - name: Phase 2 summary
