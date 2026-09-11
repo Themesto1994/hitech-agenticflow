@@ -42,6 +42,11 @@ name: Agentic Test Pipeline
 #   kane-cli evidence merge does not accept --output; the correct flag is
 #   --out.  The merge step now uses --out "$merged".
 #
+# FIX 7 — Phase 5: evidence merge missing required --run-id flag
+#   kane-cli evidence merge requires --run-id to stamp the merged archive
+#   with a unique identity.  Without it the command exits with code 2.
+#   The GitHub Actions run ID (${{ github.run_id }}) is used as the value.
+#
 # Required secrets:
 #   KANE_USERNAME / KANE_ACCESS_KEY  — TestMu credentials
 #   LT_USERNAME   / LT_ACCESS_KEY   — LambdaTest credentials
@@ -879,7 +884,10 @@ jobs:
           if [ "${#packs[@]}" -gt 1 ]; then
             echo "Merging ${#packs[@]} packs..."
             # FIX 6: --output is not a valid flag; the correct flag is --out
-            kane-cli evidence merge "${packs[@]}" --out "$merged"
+            # FIX 7: --run-id is required to stamp the merged archive identity
+            kane-cli evidence merge "${packs[@]}" \
+              --run-id "${{ github.run_id }}" \
+              --out "$merged"
             echo "merged_packs=${#packs[@]}" >> "$GITHUB_OUTPUT"
           elif [ "${#packs[@]}" -eq 1 ]; then
             echo "Single pack — copying as merged archive."
