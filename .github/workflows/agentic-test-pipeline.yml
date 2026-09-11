@@ -32,6 +32,16 @@ name: Agentic Test Pipeline
 #   design-tests run script so it stays invisible in the step list but
 #   runs before the design loop.
 #
+# FIX 5 (v8) — Phase 3: set -e + && short-circuit caused false exit-code-1
+#   The pattern `[ "$status" -ne 0 ] && { ... }` exits with code 1 when a
+#   test PASSES (status=0 makes the [ ] test false; && short-circuits; the
+#   whole expression returns 1; set -e kills the script).  Replaced with a
+#   proper if/then/fi block so a passing test no longer aborts the loop.
+#
+# FIX 6 (v8) — Phase 5: evidence merge used --output (unknown flag)
+#   kane-cli evidence merge does not accept --output; the correct flag is
+#   --out.  The merge step now uses --out "$merged".
+#
 # Required secrets:
 #   KANE_USERNAME / KANE_ACCESS_KEY  — TestMu credentials
 #   LT_USERNAME   / LT_ACCESS_KEY   — LambdaTest credentials
@@ -515,7 +525,11 @@ jobs:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
         run: |
-          set -e
+          # FIX 5: Do NOT use set -e here. The pattern
+          #   `[ "$status" -ne 0 ] && { ... }`
+          # exits with code 1 when a test PASSES (status=0 makes the [ ] test
+          # false; && short-circuits; whole expression returns 1; set -e kills
+          # the script). Use if/then/fi instead to safely handle both outcomes.
           failed=0
           : > authoring_links.tsv
  
@@ -552,13 +566,19 @@ jobs:
               --code-export \
               --code-language "${{ inputs.test_language }}" | tee "$test_out"
             status=${PIPESTATUS[0]}
-            [ "$status" -ne 0 ] && { echo "::warning::Failed: $test_file"; failed=$((failed+1)); }
+            # FIX 5: use if/then/fi — avoids bash treating a false [ ] as fatal
+            if [ "$status" -ne 0 ]; then
+              echo "::warning::Failed: $test_file"
+              failed=$((failed+1))
+            fi
             share_url=$(grep -o '"share_url":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
             testcase_id=$(grep -o '"testcase_id":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
             printf '%s\t%s\t%s\n' "$test_file" "${testcase_id:-N/A}" "${share_url:-N/A}" >> authoring_links.tsv
             rm -f "$test_out"
           done < selected_tests.txt
-          [ "$failed" -gt 0 ] && echo "::warning::$failed test(s) failed."
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed test(s) failed."
+          fi
  
       # FIX 2: --agent removed; project/folder passed via config set (layer b)
       - name: "testrun run — Bundle all tests into one sealed run"
@@ -858,7 +878,8 @@ jobs:
  
           if [ "${#packs[@]}" -gt 1 ]; then
             echo "Merging ${#packs[@]} packs..."
-            kane-cli evidence merge "${packs[@]}" --output "$merged"
+            # FIX 6: --output is not a valid flag; the correct flag is --out
+            kane-cli evidence merge "${packs[@]}" --out "$merged"
             echo "merged_packs=${#packs[@]}" >> "$GITHUB_OUTPUT"
           elif [ "${#packs[@]}" -eq 1 ]; then
             echo "Single pack — copying as merged archive."
@@ -992,4 +1013,3 @@ jobs:
             echo "---"
             echo "### Pipeline Complete"
           } >> "$GITHUB_STEP_SUMMARY"
- 
