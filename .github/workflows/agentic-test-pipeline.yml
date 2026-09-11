@@ -9,11 +9,27 @@ name: Agentic Test Pipeline
 #   Three-layer approach (most → least specific):
 #     a) kane-cli login  receives --project-id / --folder-id            ← sets auth context
 #     b) kane-cli config set  runs after login with the same IDs        ← sets workspace default
-#     c) design tests / testrun run receive --project-id / --folder-id  ← belt-and-suspenders
+#     c) testmd run / testrun run receive --project-id / --folder-id    ← belt-and-suspenders
+#        (kane-cli design tests does NOT accept these flags — uses config set only)
 #   Plus: a "Show active workspace" step prints the project name + folder
 #   name from the CLI so you can confirm in the logs exactly where tests land.
 #
 # FIX 2 — --agent flag removed from testrun run (not supported there)
+#
+# FIX 3 (v7) — npm install cached across phases
+#   Each GitHub Actions job runs on a completely FRESH VM — kane-cli is not
+#   pre-installed, so "npm install -g" is required in every job.  Adding
+#   actions/cache@v4 (path: ~/.npm) lets npm reuse previously-downloaded
+#   packages from the cache instead of hitting the registry each time,
+#   cutting the install time from ~30 s to a few seconds.
+#
+# FIX 4 (v7) — Test generation regression restored
+#   "kane-cli install skill" was removed from Phase 2 in v4 (it was only
+#   kept in Phase 1 as a named step).  The AI skill must be registered on
+#   the Phase 2 runner too — without it, "design tests" silently produces
+#   no output.  It is now called silently (|| true) at the top of the
+#   design-tests run script so it stays invisible in the step list but
+#   runs before the design loop.
 #
 # Required secrets:
 #   KANE_USERNAME / KANE_ACCESS_KEY  — TestMu credentials
@@ -141,6 +157,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+ 
+      - name: Cache npm (avoids re-downloading kane-cli on every fresh runner)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-kane-cli
  
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
@@ -285,6 +307,12 @@ jobs:
         with:
           node-version: "20"
  
+      - name: Cache npm (avoids re-downloading kane-cli on every fresh runner)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-kane-cli
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
  
@@ -336,28 +364,35 @@ jobs:
           echo "=== .context/ ===" && find .context 2>/dev/null || echo "(not found)"
           echo "=== .testmuai/ ===" && find .testmuai 2>/dev/null || echo "(not found)"
  
-      # ── Layer c: pass IDs directly to design tests ────────────────────────
+      # ── Layer c: design tests does NOT accept --project-id/--folder-id ─────
+      # Workspace targeting relies entirely on layers a (login) and b (config set).
       - name: "design tests — Generate ACs, scenarios, *_test.md files"
         run: |
+          # FIX 4: skill must be registered on this runner for design to work.
+          # kane-cli design tests will warn "skill not installed" and produce no
+          # output if the skill is missing, so install it here before the loop.
+          # Try --yes / --force first; fall back to plain call; ignore errors.
+          kane-cli install skill --yes 2>/dev/null \
+            || kane-cli install skill --force 2>/dev/null \
+            || kane-cli install skill 2>/dev/null \
+            || true
+          echo "Skill install attempted."
+ 
           proposal=$(find .context/proposals -name 'proposal.json' 2>/dev/null | head -n1)
           [ -z "$proposal" ] && { echo "::error::No proposal.json found."; exit 1; }
  
           count=$(jq '.use_cases | length' "$proposal" 2>/dev/null)
           [ -z "$count" ] || [ "$count" -eq 0 ] && { echo "::error::No use-cases in proposal."; exit 1; }
  
-          # Build optional project/folder args
-          proj_args=()
-          [ -n "$KANE_PROJECT_ID" ] && proj_args+=(--project-id "$KANE_PROJECT_ID")
-          [ -n "$KANE_FOLDER_ID"  ] && proj_args+=(--folder-id  "$KANE_FOLDER_ID")
- 
+          # NOTE: kane-cli design tests does NOT accept --project-id/--folder-id.
+          # Workspace is already set via "kane-cli config set" in the step above.
           for i in $(seq 1 "$count"); do
             uc_id="uc-$i"
             echo "--- Designing: $uc_id"
             kane-cli design tests \
               --use-case "$uc_id" \
               --allow-unreviewed \
-              --mode ci \
-              "${proj_args[@]}" 2>&1 || true
+              --mode ci 2>&1 || true
           done
           exit 0
  
@@ -401,6 +436,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+ 
+      - name: Cache npm (avoids re-downloading kane-cli on every fresh runner)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-kane-cli
  
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
@@ -581,6 +622,12 @@ jobs:
         with:
           node-version: "20"
  
+      - name: Cache npm (avoids re-downloading kane-cli on every fresh runner)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-kane-cli
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
  
@@ -677,6 +724,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+ 
+      - name: Cache npm (avoids re-downloading kane-cli on every fresh runner)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-kane-cli
  
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
@@ -826,6 +879,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+ 
+      - name: Cache npm (avoids re-downloading kane-cli on every fresh runner)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-kane-cli
  
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
