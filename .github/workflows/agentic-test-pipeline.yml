@@ -10,23 +10,27 @@ name: Agentic Test Pipeline
 # ║   Phase 6 ─ MAINTAIN  kane-cli maintain  ← ONLY runs when PRD changes  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 #
-# NOTE ON --agent FLAG:
-#   --agent outputs structured NDJSON and is only supported by RUN commands:
-#     kane-cli testmd run  →  supported  ✅
-#     kane-cli testrun run →  supported  ✅
-#   All other assurance commands (ingest, extract, review, design, cover,
-#   evidence, maintain) do NOT support --agent and will error if passed it.
+# FIXES IN THIS VERSION
+# ─────────────────────
+# FIX 1 — Folder / Project IDs not respected (new folder created each run)
+#   Root cause: kane-cli login does NOT persist project/folder as the active
+#   workspace for subsequent commands.  A "kane-cli config set" call is
+#   required AFTER login in every job.  The values are read at runtime from
+#   the workflow inputs via env-vars — nothing is hardcoded.
 #
-# NOTE ON MAINTAIN PHASE:
-#   Phase 6 only executes when the PRD file has changed compared with the
-#   previous commit on the default branch (main/master).  This avoids
-#   re-running maintenance on every pipeline trigger when the requirements
-#   have not been updated.
+# FIX 2 — --agent flag rejected by testrun run
+#   Root cause: --agent is only valid for "kane-cli testmd run".
+#   It has been removed from the "testrun run" step.
+#
+# NOTE ON --agent FLAG:
+#   --agent outputs structured NDJSON and is ONLY supported by:
+#     kane-cli testmd run  →  supported  ✅
+#     kane-cli testrun run →  NOT supported  ❌  (removed)
 #
 # Required secrets:
 #   KANE_USERNAME / KANE_ACCESS_KEY  — TestMu credentials
 #   LT_USERNAME   / LT_ACCESS_KEY   — LambdaTest credentials
-
+ 
 on:
   workflow_dispatch:
     inputs:
@@ -99,9 +103,16 @@ on:
         required: true
       LT_ACCESS_KEY:
         required: true
-
+ 
+# ──────────────────────────────────────────────────────────────────────────
+# Reusable snippet (referenced in each job as a named step):
+#   Set project and folder context — FIX 1
+#   Reads project-id and folder-id from runtime env-vars (populated by
+#   ${{ inputs.* }} at job level) so nothing is ever hardcoded in the YAML.
+# ──────────────────────────────────────────────────────────────────────────
+ 
 jobs:
-
+ 
   # ══════════════════════════════════════════════════════════════════════════
   # PRD CHANGE DETECTION
   # ══════════════════════════════════════════════════════════════════════════
@@ -115,19 +126,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-
+ 
       - name: Detect PRD change
         id: check
         run: |
           prd=$(find . -maxdepth 2 \( -iname '*.pdf' -o -iname '*.docx' \) | head -n1)
           echo "prd_file=${prd}" >> "$GITHUB_OUTPUT"
-
+ 
           if [ -z "$prd" ]; then
             echo "::warning::No PRD file found — treating as unchanged."
             echo "prd_changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
+ 
           if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -qF "${prd#./}"; then
             echo "PRD changed: $prd"
             echo "prd_changed=true" >> "$GITHUB_OUTPUT"
@@ -135,7 +146,7 @@ jobs:
             echo "PRD unchanged: $prd"
             echo "prd_changed=false" >> "$GITHUB_OUTPUT"
           fi
-
+ 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 1 — CONTEXT
   # ══════════════════════════════════════════════════════════════════════════
@@ -143,26 +154,37 @@ jobs:
     name: "Phase 1 — Context: Ingest the PRD"
     needs: detect-prd-change
     runs-on: ubuntu-latest
+    # FIX 1: expose runtime inputs as env-vars so the config step below
+    # can read them without embedding literal values in any script.
+    env:
+      KANE_PROJECT_ID: ${{ inputs.kane_project_id }}
+      KANE_FOLDER_ID:  ${{ inputs.kane_folder_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Update kane-cli skill
         run: kane-cli install skill || true
-
+ 
       - name: Login
         run: |
-          set -e
-          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
-          [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
-          kane-cli login "${args[@]}"
-
+          kane-cli login \
+            --username "${{ secrets.KANE_USERNAME }}" \
+            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+ 
+      # FIX 1: set workspace AFTER login using runtime env-vars (not hardcoded)
+      - name: Set project and folder context
+        run: |
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" \
+            && echo "Project ID set: $KANE_PROJECT_ID"
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  \
+            && echo "Folder  ID set: $KANE_FOLDER_ID"
+ 
       - name: Resolve requirements document
         id: resolve
         run: |
@@ -174,13 +196,13 @@ jobs:
           [ ! -f "$doc" ] && { echo "::error::'$doc' not found in repo.";  exit 1; }
           echo "doc=$doc" >> "$GITHUB_OUTPUT"
           echo "Using: $doc"
-
+ 
       - name: "context ingest — Snapshot PRD into .context/ store"
         run: kane-cli context ingest "${{ steps.resolve.outputs.doc }}" --mode ci
-
+ 
       - name: "context extract — Extract use-cases from PRD"
         run: kane-cli context extract --mode ci
-
+ 
       - name: "context review — Auto-approve all use-cases in CI"
         run: |
           proposal=$(find .context/proposals -name 'proposal.json' 2>/dev/null | head -n1)
@@ -195,14 +217,14 @@ jobs:
           else
             echo "::warning::No proposal.json found; skipping review."
           fi
-
+ 
       - name: Debug — show where kane-cli stored context data
         run: |
           echo "=== .context/ ==="
           find .context 2>/dev/null || echo "(not found)"
           echo "=== .testmuai/ ==="
           find .testmuai 2>/dev/null || echo "(not found)"
-
+ 
       - name: Upload context store
         uses: actions/upload-artifact@v4
         with:
@@ -213,7 +235,7 @@ jobs:
             .testmuai
           if-no-files-found: warn
           retention-days: 14
-
+ 
       - name: Phase 1 summary
         if: always()
         run: |
@@ -225,7 +247,7 @@ jobs:
             echo "| Extract | \`kane-cli context extract\` |"
             echo "| Review | \`kane-cli context review --approve uc-N\` |"
           } >> "$GITHUB_STEP_SUMMARY"
-
+ 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 2 — DESIGN
   # ══════════════════════════════════════════════════════════════════════════
@@ -233,6 +255,9 @@ jobs:
     name: "Phase 2 — Design: ACs to Tests"
     needs: context
     runs-on: ubuntu-latest
+    env:
+      KANE_PROJECT_ID: ${{ inputs.kane_project_id }}
+      KANE_FOLDER_ID:  ${{ inputs.kane_folder_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -242,54 +267,56 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
-          set -e
-          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
-          [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
-          kane-cli login "${args[@]}"
-
+          kane-cli login \
+            --username "${{ secrets.KANE_USERNAME }}" \
+            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+ 
+      # FIX 1
+      - name: Set project and folder context
+        run: |
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+ 
       - name: Debug — verify context data restored
         run: |
           echo "=== .context/ ===" && find .context 2>/dev/null || echo "(not found)"
           echo "=== .testmuai/ ===" && find .testmuai 2>/dev/null || echo "(not found)"
-
+ 
       - name: "design tests — Generate ACs, scenarios, *_test.md files"
         run: |
           proposal=$(find .context/proposals -name 'proposal.json' 2>/dev/null | head -n1)
-
+ 
           if [ -z "$proposal" ]; then
             echo "::error::No proposal.json found under .context/proposals/."
             exit 1
           fi
-
+ 
           echo "Using proposal: $proposal"
           count=$(jq '.use_cases | length' "$proposal" 2>/dev/null)
-
+ 
           if [ -z "$count" ] || [ "$count" -eq 0 ]; then
             echo "::error::No use-cases found in proposal.json"
             exit 1
           fi
-
+ 
           echo "Designing tests for $count use-case(s): uc-1 through uc-$count"
           kane-cli install skill 2>/dev/null || true
-
+ 
           for i in $(seq 1 "$count"); do
             uc_id="uc-$i"
             echo "--- Designing tests for use-case: $uc_id"
-            # || true: kane-cli exits 1 on approval warnings even when _test.md IS written.
-            # Files are generated correctly — suppress the non-zero exit so the step passes.
             kane-cli design tests --use-case "$uc_id" --allow-unreviewed --mode ci 2>&1 || true
           done
-
+ 
           echo "Design loop complete."
           exit 0
-
+ 
       - name: Upload designed tests
         uses: actions/upload-artifact@v4
         with:
@@ -299,7 +326,7 @@ jobs:
             .context
             .testmuai
           retention-days: 14
-
+ 
       - name: Phase 2 summary
         if: always()
         run: |
@@ -308,7 +335,7 @@ jobs:
             echo "## Phase 2 — Design: ACs to Tests"
             echo "**Tests designed:** $test_count \`*_test.md\` file(s)"
           } >> "$GITHUB_STEP_SUMMARY"
-
+ 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 3 — RUN
   # ══════════════════════════════════════════════════════════════════════════
@@ -316,6 +343,9 @@ jobs:
     name: "Phase 3 — Run: Author, Replay"
     needs: design
     runs-on: ubuntu-latest
+    env:
+      KANE_PROJECT_ID: ${{ inputs.kane_project_id }}
+      KANE_FOLDER_ID:  ${{ inputs.kane_folder_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -325,22 +355,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
-          set -e
-          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
-          [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
-          kane-cli login "${args[@]}"
-
+          kane-cli login \
+            --username "${{ secrets.KANE_USERNAME }}" \
+            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+ 
+      # FIX 1
+      - name: Set project and folder context
+        run: |
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+ 
       - name: Set default start URL
         if: ${{ inputs.start_url != '' }}
         run: kane-cli config set-url "${{ inputs.start_url }}"
-
+ 
       - name: Select tests to run
         id: select
         run: |
@@ -356,7 +390,7 @@ jobs:
           printf '%s\0' "${selected[@]}" > selected_tests.txt
           echo "count=${#selected[@]}" >> "$GITHUB_OUTPUT"
           echo "Running ${#selected[@]} of $total tests."
-
+ 
       - name: "testmd run — Author + replay each test"
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
@@ -381,7 +415,8 @@ jobs:
             rm -f "$test_out"
           done < selected_tests.txt
           [ "$failed" -gt 0 ] && echo "::warning::$failed test(s) failed."
-
+ 
+      # FIX 2: --agent removed — not supported by testrun run
       - name: "testrun run — Bundle all tests into one sealed run"
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
@@ -390,10 +425,9 @@ jobs:
           mapfile -d '' -t test_files < selected_tests.txt
           kane-cli testrun run "${test_files[@]}" \
             --headless \
-            --agent \
             --on-failure continue \
             --name "agentic-pipeline run ${{ github.run_id }}" | tee testrun_output.ndjson
-
+ 
       - name: Collect evidence packs
         if: always()
         id: collect
@@ -402,7 +436,7 @@ jobs:
           find .testmuai/evidence -name '*.evidence' -exec cp {} evidence-pack/ \; 2>/dev/null || true
           count=$(ls evidence-pack/*.evidence 2>/dev/null | wc -l || echo 0)
           echo "pack_count=$count" >> "$GITHUB_OUTPUT"
-
+ 
       - name: Upload run outputs
         if: always()
         uses: actions/upload-artifact@v4
@@ -414,7 +448,7 @@ jobs:
             authoring_links.tsv
             .testmuai/tests/**/playwright-${{ inputs.test_language }}-code/**
           retention-days: 14
-
+ 
       - name: Phase 3 summary
         if: always()
         run: |
@@ -423,7 +457,7 @@ jobs:
             echo "**Tests run:** ${{ steps.select.outputs.count }}"
             echo "**Evidence packs:** ${{ steps.collect.outputs.pack_count }}"
           } >> "$GITHUB_STEP_SUMMARY"
-
+ 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 4 — COVER
   # ══════════════════════════════════════════════════════════════════════════
@@ -432,6 +466,9 @@ jobs:
     needs: run
     runs-on: ubuntu-latest
     if: always()
+    env:
+      KANE_PROJECT_ID: ${{ inputs.kane_project_id }}
+      KANE_FOLDER_ID:  ${{ inputs.kane_folder_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -445,24 +482,28 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
-          set -e
-          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
-          [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
-          kane-cli login "${args[@]}"
-
+          kane-cli login \
+            --username "${{ secrets.KANE_USERNAME }}" \
+            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+ 
+      # FIX 1
+      - name: Set project and folder context
+        run: |
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+ 
       - name: Copy evidence packs
         run: |
           mkdir -p .testmuai/evidence
           cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ 2>/dev/null || \
             echo "::warning::No evidence packs found."
-
+ 
       - name: "cover — Measure proved vs owed coverage"
         run: |
           pack=$(ls .testmuai/evidence/*.evidence 2>/dev/null | head -n1)
@@ -471,7 +512,7 @@ jobs:
           else
             echo "No evidence pack available." | tee coverage_output.txt
           fi
-
+ 
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
@@ -479,7 +520,7 @@ jobs:
           name: coverage-report
           path: coverage_output.txt
           retention-days: 14
-
+ 
       - name: Phase 4 summary
         if: always()
         run: |
@@ -487,7 +528,7 @@ jobs:
             echo "## Phase 4 — Cover: Prove and Gate"
             [ -f coverage_output.txt ] && { echo '```'; cat coverage_output.txt; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
-
+ 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 5 — EVIDENCE
   # ══════════════════════════════════════════════════════════════════════════
@@ -496,6 +537,9 @@ jobs:
     needs: cover
     runs-on: ubuntu-latest
     if: always()
+    env:
+      KANE_PROJECT_ID: ${{ inputs.kane_project_id }}
+      KANE_FOLDER_ID:  ${{ inputs.kane_folder_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -505,24 +549,28 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
-          set -e
-          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
-          [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
-          kane-cli login "${args[@]}"
-
+          kane-cli login \
+            --username "${{ secrets.KANE_USERNAME }}" \
+            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+ 
+      # FIX 1
+      - name: Set project and folder context
+        run: |
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+ 
       - name: Copy evidence packs
         run: |
           mkdir -p .testmuai/evidence
           cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ 2>/dev/null || \
             echo "::warning::No evidence packs found."
-
+ 
       - name: "evidence validate — Check each pack's integrity"
         id: validate
         run: |
@@ -540,7 +588,7 @@ jobs:
           done
           echo "failed=$failed" >> "$GITHUB_OUTPUT"
           [ "$failed" -gt 0 ] && echo "::warning::$failed pack(s) failed validation."
-
+ 
       - name: "evidence merge — Combine all packs into one archive"
         id: merge
         run: |
@@ -557,7 +605,7 @@ jobs:
             echo "merged_packs=0" >> "$GITHUB_OUTPUT"
           fi
           echo "merged_path=$merged" >> "$GITHUB_OUTPUT"
-
+ 
       - name: Upload merged evidence pack
         if: always()
         uses: actions/upload-artifact@v4
@@ -565,7 +613,7 @@ jobs:
           name: evidence-merged
           path: .testmuai/evidence/merged-${{ github.run_id }}.evidence
           retention-days: 30
-
+ 
       - name: Phase 5 summary
         if: always()
         run: |
@@ -577,7 +625,7 @@ jobs:
             echo "| \`evidence merge\` | ${{ steps.merge.outputs.merged_packs }} pack(s) merged |"
             [ -f validation_log.txt ] && { echo '```'; cat validation_log.txt; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
-
+ 
   # ══════════════════════════════════════════════════════════════════════════
   # PHASE 6 — MAINTAIN (only when PRD changes or manual trigger)
   # ══════════════════════════════════════════════════════════════════════════
@@ -591,6 +639,9 @@ jobs:
         needs.detect-prd-change.outputs.prd_changed == 'true' ||
         github.event_name == 'workflow_dispatch'
       )
+    env:
+      KANE_PROJECT_ID: ${{ inputs.kane_project_id }}
+      KANE_FOLDER_ID:  ${{ inputs.kane_folder_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -602,29 +653,33 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
+ 
       - name: Install kane-cli
         run: npm install -g @testmuai/kane-cli@latest
-
+ 
       - name: Login
         run: |
-          set -e
-          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
-          [ -n "${{ inputs.kane_project_id }}" ] && args+=(--project-id "${{ inputs.kane_project_id }}")
-          [ -n "${{ inputs.kane_folder_id }}" ]  && args+=(--folder-id  "${{ inputs.kane_folder_id }}")
-          kane-cli login "${args[@]}"
-
+          kane-cli login \
+            --username "${{ secrets.KANE_USERNAME }}" \
+            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+ 
+      # FIX 1
+      - name: Set project and folder context
+        run: |
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+ 
       - name: Show PRD change reason
         run: |
           echo "PRD changed: ${{ needs.detect-prd-change.outputs.prd_changed }}"
           echo "Triggered by: ${{ github.event_name }}"
           echo "PRD file: ${{ needs.detect-prd-change.outputs.prd_file }}"
-
+ 
       - name: "maintain — Reconcile test suite against current requirements"
         run: |
           kane-cli maintain --mode ci 2>&1 | tee maintain_output.txt || \
             echo "::warning::Maintain completed with warnings."
-
+ 
       - name: Phase 6 summary
         if: always()
         run: |
@@ -636,3 +691,4 @@ jobs:
             echo "---"
             echo "### Pipeline Complete"
           } >> "$GITHUB_STEP_SUMMARY"
+ 
