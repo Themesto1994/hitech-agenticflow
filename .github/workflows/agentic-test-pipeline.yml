@@ -1,31 +1,19 @@
 name: Agentic Test Pipeline
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  One loop, from requirement to proof  (TestMu AI Assurance)             ║
-# ║                                                                          ║
-# ║   Phase 1 ─ CONTEXT   kane-cli context ingest/extract/review            ║
-# ║   Phase 2 ─ DESIGN    kane-cli design tests                             ║
-# ║   Phase 3 ─ RUN       kane-cli testmd run + testrun run                 ║
-# ║   Phase 4 ─ COVER     kane-cli cover                                    ║
-# ║   Phase 5 ─ EVIDENCE  kane-cli evidence validate + merge                ║
-# ║   Phase 6 ─ MAINTAIN  kane-cli maintain  ← ONLY runs when PRD changes  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 #
 # FIXES IN THIS VERSION
 # ─────────────────────
-# FIX 1 — Folder / Project IDs not respected (new folder created each run)
-#   Root cause: kane-cli login does NOT persist project/folder as the active
-#   workspace for subsequent commands.  A "kane-cli config set" call is
-#   required AFTER login in every job.  The values are read at runtime from
-#   the workflow inputs via env-vars — nothing is hardcoded.
+# FIX 1 — Project / Folder ID not respected
+#   Three-layer approach (most → least specific):
+#     a) kane-cli login  receives --project-id / --folder-id            ← sets auth context
+#     b) kane-cli config set  runs after login with the same IDs        ← sets workspace default
+#     c) design tests / testrun run receive --project-id / --folder-id  ← belt-and-suspenders
+#   Plus: a "Show active workspace" step prints the project name + folder
+#   name from the CLI so you can confirm in the logs exactly where tests land.
 #
-# FIX 2 — --agent flag rejected by testrun run
-#   Root cause: --agent is only valid for "kane-cli testmd run".
-#   It has been removed from the "testrun run" step.
-#
-# NOTE ON --agent FLAG:
-#   --agent outputs structured NDJSON and is ONLY supported by:
-#     kane-cli testmd run  →  supported  ✅
-#     kane-cli testrun run →  NOT supported  ❌  (removed)
+# FIX 2 — --agent flag removed from testrun run (not supported there)
 #
 # Required secrets:
 #   KANE_USERNAME / KANE_ACCESS_KEY  — TestMu credentials
@@ -104,13 +92,6 @@ on:
       LT_ACCESS_KEY:
         required: true
  
-# ──────────────────────────────────────────────────────────────────────────
-# Reusable snippet (referenced in each job as a named step):
-#   Set project and folder context — FIX 1
-#   Reads project-id and folder-id from runtime env-vars (populated by
-#   ${{ inputs.* }} at job level) so nothing is ever hardcoded in the YAML.
-# ──────────────────────────────────────────────────────────────────────────
- 
 jobs:
  
   # ══════════════════════════════════════════════════════════════════════════
@@ -132,13 +113,11 @@ jobs:
         run: |
           prd=$(find . -maxdepth 2 \( -iname '*.pdf' -o -iname '*.docx' \) | head -n1)
           echo "prd_file=${prd}" >> "$GITHUB_OUTPUT"
- 
           if [ -z "$prd" ]; then
             echo "::warning::No PRD file found — treating as unchanged."
             echo "prd_changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
- 
           if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -qF "${prd#./}"; then
             echo "PRD changed: $prd"
             echo "prd_changed=true" >> "$GITHUB_OUTPUT"
@@ -154,8 +133,6 @@ jobs:
     name: "Phase 1 — Context: Ingest the PRD"
     needs: detect-prd-change
     runs-on: ubuntu-latest
-    # FIX 1: expose runtime inputs as env-vars so the config step below
-    # can read them without embedding literal values in any script.
     env:
       KANE_PROJECT_ID: ${{ inputs.kane_project_id }}
       KANE_FOLDER_ID:  ${{ inputs.kane_folder_id }}
@@ -171,19 +148,59 @@ jobs:
       - name: Update kane-cli skill
         run: kane-cli install skill || true
  
+      # ── Layer a: login with IDs ───────────────────────────────────────────
       - name: Login
         run: |
-          kane-cli login \
-            --username "${{ secrets.KANE_USERNAME }}" \
-            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          [ -n "$KANE_PROJECT_ID" ] && args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && args+=(--folder-id  "$KANE_FOLDER_ID")
+          kane-cli login "${args[@]}"
  
-      # FIX 1: set workspace AFTER login using runtime env-vars (not hardcoded)
+      # ── Layer b: config set after login ──────────────────────────────────
       - name: Set project and folder context
         run: |
-          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" \
-            && echo "Project ID set: $KANE_PROJECT_ID"
-          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  \
-            && echo "Folder  ID set: $KANE_FOLDER_ID"
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" || true
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  || true
+ 
+      # ── Diagnostic: resolve IDs → names ──────────────────────────────────
+      - name: "🔍 Show active project and folder"
+        run: |
+          echo "=== Resolving project and folder names ==="
+ 
+          # --- Project name ---
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJECT_NAME=$(
+              kane-cli project list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_PROJECT_ID\" or .projectId == \"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || kane-cli project list 2>/dev/null | grep -i "$KANE_PROJECT_ID" | head -n1 \
+              || echo ""
+            )
+            if [ -n "$PROJECT_NAME" ]; then
+              echo "  Project : $PROJECT_NAME  (id: $KANE_PROJECT_ID)"
+            else
+              echo "  Project ID : $KANE_PROJECT_ID  (name not resolved — check kane-cli project list)"
+            fi
+          else
+            echo "  Project : <account default> (no ID provided)"
+          fi
+ 
+          # --- Folder name ---
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLDER_NAME=$(
+              kane-cli folder list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_FOLDER_ID\" or .folderId == \"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || kane-cli folder list 2>/dev/null | grep -i "$KANE_FOLDER_ID" | head -n1 \
+              || echo ""
+            )
+            if [ -n "$FOLDER_NAME" ]; then
+              echo "  Folder  : $FOLDER_NAME  (id: $KANE_FOLDER_ID)"
+            else
+              echo "  Folder ID : $KANE_FOLDER_ID  (name not resolved — check kane-cli folder list)"
+            fi
+          else
+            echo "  Folder  : <account default> (no ID provided)"
+          fi
  
       - name: Resolve requirements document
         id: resolve
@@ -197,33 +214,30 @@ jobs:
           echo "doc=$doc" >> "$GITHUB_OUTPUT"
           echo "Using: $doc"
  
-      - name: "context ingest — Snapshot PRD into .context/ store"
+      - name: "context ingest"
         run: kane-cli context ingest "${{ steps.resolve.outputs.doc }}" --mode ci
  
-      - name: "context extract — Extract use-cases from PRD"
+      - name: "context extract"
         run: kane-cli context extract --mode ci
  
-      - name: "context review — Auto-approve all use-cases in CI"
+      - name: "context review — auto-approve all use-cases"
         run: |
           proposal=$(find .context/proposals -name 'proposal.json' 2>/dev/null | head -n1)
           if [ -n "$proposal" ]; then
             count=$(jq '.use_cases | length' "$proposal" 2>/dev/null)
             echo "Approving $count use-case(s)..."
             for i in $(seq 1 "$count"); do
-              echo "  Approving uc-$i"
               kane-cli context review --approve "uc-$i" 2>/dev/null || \
-                echo "::warning::Could not approve uc-$i (may already be approved)"
+                echo "::warning::Could not approve uc-$i"
             done
           else
             echo "::warning::No proposal.json found; skipping review."
           fi
  
-      - name: Debug — show where kane-cli stored context data
+      - name: Debug — show stored context paths
         run: |
-          echo "=== .context/ ==="
-          find .context 2>/dev/null || echo "(not found)"
-          echo "=== .testmuai/ ==="
-          find .testmuai 2>/dev/null || echo "(not found)"
+          echo "=== .context/ ===" && find .context 2>/dev/null || echo "(not found)"
+          echo "=== .testmuai/ ===" && find .testmuai 2>/dev/null || echo "(not found)"
  
       - name: Upload context store
         uses: actions/upload-artifact@v4
@@ -240,12 +254,15 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Phase 1 — Context: Ingest the PRD"
+            echo "## Phase 1 — Context"
             echo "| Step | Command |"
             echo "|---|---|"
             echo "| Ingest | \`kane-cli context ingest\` |"
             echo "| Extract | \`kane-cli context extract\` |"
             echo "| Review | \`kane-cli context review --approve uc-N\` |"
+            echo ""
+            echo "**Project ID:** \`${KANE_PROJECT_ID:-<account default>}\`"
+            echo "**Folder  ID:** \`${KANE_FOLDER_ID:-<account default>}\`"
           } >> "$GITHUB_STEP_SUMMARY"
  
   # ══════════════════════════════════════════════════════════════════════════
@@ -273,48 +290,75 @@ jobs:
  
       - name: Login
         run: |
-          kane-cli login \
-            --username "${{ secrets.KANE_USERNAME }}" \
-            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          [ -n "$KANE_PROJECT_ID" ] && args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && args+=(--folder-id  "$KANE_FOLDER_ID")
+          kane-cli login "${args[@]}"
  
-      # FIX 1
       - name: Set project and folder context
         run: |
-          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
-          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" || true
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  || true
+ 
+      # ── Diagnostic ───────────────────────────────────────────────────────
+      - name: "🔍 Show active project and folder"
+        run: |
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJECT_NAME=$(
+              kane-cli project list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_PROJECT_ID\" or .projectId == \"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || kane-cli project list 2>/dev/null | grep -i "$KANE_PROJECT_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$PROJECT_NAME" ] \
+              && echo "  Project : $PROJECT_NAME  (id: $KANE_PROJECT_ID)" \
+              || echo "  Project ID : $KANE_PROJECT_ID  (name not resolved)"
+          else
+            echo "  Project : <account default>"
+          fi
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLDER_NAME=$(
+              kane-cli folder list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_FOLDER_ID\" or .folderId == \"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || kane-cli folder list 2>/dev/null | grep -i "$KANE_FOLDER_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$FOLDER_NAME" ] \
+              && echo "  Folder  : $FOLDER_NAME  (id: $KANE_FOLDER_ID)" \
+              || echo "  Folder ID : $KANE_FOLDER_ID  (name not resolved)"
+          else
+            echo "  Folder  : <account default>"
+          fi
  
       - name: Debug — verify context data restored
         run: |
           echo "=== .context/ ===" && find .context 2>/dev/null || echo "(not found)"
           echo "=== .testmuai/ ===" && find .testmuai 2>/dev/null || echo "(not found)"
  
+      # ── Layer c: pass IDs directly to design tests ────────────────────────
       - name: "design tests — Generate ACs, scenarios, *_test.md files"
         run: |
           proposal=$(find .context/proposals -name 'proposal.json' 2>/dev/null | head -n1)
+          [ -z "$proposal" ] && { echo "::error::No proposal.json found."; exit 1; }
  
-          if [ -z "$proposal" ]; then
-            echo "::error::No proposal.json found under .context/proposals/."
-            exit 1
-          fi
- 
-          echo "Using proposal: $proposal"
           count=$(jq '.use_cases | length' "$proposal" 2>/dev/null)
+          [ -z "$count" ] || [ "$count" -eq 0 ] && { echo "::error::No use-cases in proposal."; exit 1; }
  
-          if [ -z "$count" ] || [ "$count" -eq 0 ]; then
-            echo "::error::No use-cases found in proposal.json"
-            exit 1
-          fi
- 
-          echo "Designing tests for $count use-case(s): uc-1 through uc-$count"
-          kane-cli install skill 2>/dev/null || true
+          # Build optional project/folder args
+          proj_args=()
+          [ -n "$KANE_PROJECT_ID" ] && proj_args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && proj_args+=(--folder-id  "$KANE_FOLDER_ID")
  
           for i in $(seq 1 "$count"); do
             uc_id="uc-$i"
-            echo "--- Designing tests for use-case: $uc_id"
-            kane-cli design tests --use-case "$uc_id" --allow-unreviewed --mode ci 2>&1 || true
+            echo "--- Designing: $uc_id"
+            kane-cli design tests \
+              --use-case "$uc_id" \
+              --allow-unreviewed \
+              --mode ci \
+              "${proj_args[@]}" 2>&1 || true
           done
- 
-          echo "Design loop complete."
           exit 0
  
       - name: Upload designed tests
@@ -332,8 +376,10 @@ jobs:
         run: |
           test_count=$(find .testmuai/tests -name '*_test.md' 2>/dev/null | wc -l)
           {
-            echo "## Phase 2 — Design: ACs to Tests"
+            echo "## Phase 2 — Design"
             echo "**Tests designed:** $test_count \`*_test.md\` file(s)"
+            echo "**Project ID:** \`${KANE_PROJECT_ID:-<account default>}\`"
+            echo "**Folder  ID:** \`${KANE_FOLDER_ID:-<account default>}\`"
           } >> "$GITHUB_STEP_SUMMARY"
  
   # ══════════════════════════════════════════════════════════════════════════
@@ -361,15 +407,46 @@ jobs:
  
       - name: Login
         run: |
-          kane-cli login \
-            --username "${{ secrets.KANE_USERNAME }}" \
-            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          [ -n "$KANE_PROJECT_ID" ] && args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && args+=(--folder-id  "$KANE_FOLDER_ID")
+          kane-cli login "${args[@]}"
  
-      # FIX 1
       - name: Set project and folder context
         run: |
-          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
-          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" || true
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  || true
+ 
+      # ── Diagnostic ───────────────────────────────────────────────────────
+      - name: "🔍 Show active project and folder"
+        run: |
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJECT_NAME=$(
+              kane-cli project list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_PROJECT_ID\" or .projectId == \"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || kane-cli project list 2>/dev/null | grep -i "$KANE_PROJECT_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$PROJECT_NAME" ] \
+              && echo "  Project : $PROJECT_NAME  (id: $KANE_PROJECT_ID)" \
+              || echo "  Project ID : $KANE_PROJECT_ID  (name not resolved)"
+          else
+            echo "  Project : <account default>"
+          fi
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLDER_NAME=$(
+              kane-cli folder list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_FOLDER_ID\" or .folderId == \"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || kane-cli folder list 2>/dev/null | grep -i "$KANE_FOLDER_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$FOLDER_NAME" ] \
+              && echo "  Folder  : $FOLDER_NAME  (id: $KANE_FOLDER_ID)" \
+              || echo "  Folder ID : $KANE_FOLDER_ID  (name not resolved)"
+          else
+            echo "  Folder  : <account default>"
+          fi
  
       - name: Set default start URL
         if: ${{ inputs.start_url != '' }}
@@ -399,6 +476,11 @@ jobs:
           set -e
           failed=0
           : > authoring_links.tsv
+ 
+          proj_args=()
+          [ -n "$KANE_PROJECT_ID" ] && proj_args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && proj_args+=(--folder-id  "$KANE_FOLDER_ID")
+ 
           while IFS= read -r -d '' test_file; do
             echo "--- Running: $test_file"
             test_out=$(mktemp)
@@ -406,7 +488,8 @@ jobs:
               --headless \
               --agent \
               --code-export \
-              --code-language "${{ inputs.test_language }}" | tee "$test_out"
+              --code-language "${{ inputs.test_language }}" \
+              "${proj_args[@]}" | tee "$test_out"
             status=${PIPESTATUS[0]}
             [ "$status" -ne 0 ] && { echo "::warning::Failed: $test_file"; failed=$((failed+1)); }
             share_url=$(grep -o '"share_url":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
@@ -416,17 +499,22 @@ jobs:
           done < selected_tests.txt
           [ "$failed" -gt 0 ] && echo "::warning::$failed test(s) failed."
  
-      # FIX 2: --agent removed — not supported by testrun run
+      # FIX 2: --agent removed; project/folder args passed directly (layer c)
       - name: "testrun run — Bundle all tests into one sealed run"
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
         run: |
+          proj_args=()
+          [ -n "$KANE_PROJECT_ID" ] && proj_args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && proj_args+=(--folder-id  "$KANE_FOLDER_ID")
+ 
           mapfile -d '' -t test_files < selected_tests.txt
           kane-cli testrun run "${test_files[@]}" \
             --headless \
             --on-failure continue \
-            --name "agentic-pipeline run ${{ github.run_id }}" | tee testrun_output.ndjson
+            --name "agentic-pipeline run ${{ github.run_id }}" \
+            "${proj_args[@]}" | tee testrun_output.ndjson
  
       - name: Collect evidence packs
         if: always()
@@ -453,9 +541,19 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Phase 3 — Run: Author, Replay"
+            echo "## Phase 3 — Run"
             echo "**Tests run:** ${{ steps.select.outputs.count }}"
             echo "**Evidence packs:** ${{ steps.collect.outputs.pack_count }}"
+            echo "**Project ID:** \`${KANE_PROJECT_ID:-<account default>}\`"
+            echo "**Folder  ID:** \`${KANE_FOLDER_ID:-<account default>}\`"
+            if [ -f authoring_links.tsv ]; then
+              echo ""
+              echo "| Test file | TestCase ID | Share URL |"
+              echo "|---|---|---|"
+              while IFS=$'\t' read -r f tc url; do
+                echo "| \`$(basename "$f")\` | \`$tc\` | $url |"
+              done < authoring_links.tsv
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
  
   # ══════════════════════════════════════════════════════════════════════════
@@ -488,15 +586,45 @@ jobs:
  
       - name: Login
         run: |
-          kane-cli login \
-            --username "${{ secrets.KANE_USERNAME }}" \
-            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          [ -n "$KANE_PROJECT_ID" ] && args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && args+=(--folder-id  "$KANE_FOLDER_ID")
+          kane-cli login "${args[@]}"
  
-      # FIX 1
       - name: Set project and folder context
         run: |
-          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
-          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" || true
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  || true
+ 
+      - name: "🔍 Show active project and folder"
+        run: |
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJECT_NAME=$(
+              kane-cli project list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_PROJECT_ID\" or .projectId == \"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || kane-cli project list 2>/dev/null | grep -i "$KANE_PROJECT_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$PROJECT_NAME" ] \
+              && echo "  Project : $PROJECT_NAME  (id: $KANE_PROJECT_ID)" \
+              || echo "  Project ID : $KANE_PROJECT_ID  (name not resolved)"
+          else
+            echo "  Project : <account default>"
+          fi
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLDER_NAME=$(
+              kane-cli folder list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_FOLDER_ID\" or .folderId == \"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || kane-cli folder list 2>/dev/null | grep -i "$KANE_FOLDER_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$FOLDER_NAME" ] \
+              && echo "  Folder  : $FOLDER_NAME  (id: $KANE_FOLDER_ID)" \
+              || echo "  Folder ID : $KANE_FOLDER_ID  (name not resolved)"
+          else
+            echo "  Folder  : <account default>"
+          fi
  
       - name: Copy evidence packs
         run: |
@@ -504,7 +632,7 @@ jobs:
           cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ 2>/dev/null || \
             echo "::warning::No evidence packs found."
  
-      - name: "cover — Measure proved vs owed coverage"
+      - name: "cover"
         run: |
           pack=$(ls .testmuai/evidence/*.evidence 2>/dev/null | head -n1)
           if [ -n "$pack" ]; then
@@ -525,7 +653,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Phase 4 — Cover: Prove and Gate"
+            echo "## Phase 4 — Cover"
             [ -f coverage_output.txt ] && { echo '```'; cat coverage_output.txt; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY"
  
@@ -555,15 +683,45 @@ jobs:
  
       - name: Login
         run: |
-          kane-cli login \
-            --username "${{ secrets.KANE_USERNAME }}" \
-            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          [ -n "$KANE_PROJECT_ID" ] && args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && args+=(--folder-id  "$KANE_FOLDER_ID")
+          kane-cli login "${args[@]}"
  
-      # FIX 1
       - name: Set project and folder context
         run: |
-          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
-          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" || true
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  || true
+ 
+      - name: "🔍 Show active project and folder"
+        run: |
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJECT_NAME=$(
+              kane-cli project list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_PROJECT_ID\" or .projectId == \"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || kane-cli project list 2>/dev/null | grep -i "$KANE_PROJECT_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$PROJECT_NAME" ] \
+              && echo "  Project : $PROJECT_NAME  (id: $KANE_PROJECT_ID)" \
+              || echo "  Project ID : $KANE_PROJECT_ID  (name not resolved)"
+          else
+            echo "  Project : <account default>"
+          fi
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLDER_NAME=$(
+              kane-cli folder list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_FOLDER_ID\" or .folderId == \"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || kane-cli folder list 2>/dev/null | grep -i "$KANE_FOLDER_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$FOLDER_NAME" ] \
+              && echo "  Folder  : $FOLDER_NAME  (id: $KANE_FOLDER_ID)" \
+              || echo "  Folder ID : $KANE_FOLDER_ID  (name not resolved)"
+          else
+            echo "  Folder  : <account default>"
+          fi
  
       - name: Copy evidence packs
         run: |
@@ -571,7 +729,7 @@ jobs:
           cp run-outputs/evidence-pack/*.evidence .testmuai/evidence/ 2>/dev/null || \
             echo "::warning::No evidence packs found."
  
-      - name: "evidence validate — Check each pack's integrity"
+      - name: "evidence validate"
         id: validate
         run: |
           failed=0
@@ -579,29 +737,43 @@ jobs:
           for pack in .testmuai/evidence/*.evidence; do
             [ -f "$pack" ] || continue
             name=$(basename "$pack")
-            if kane-cli evidence validate "$pack" 2>&1 | tee -a validation_log.txt; then
+            # Pipe through tee but capture kane-cli's own exit code via PIPESTATUS
+            kane-cli evidence validate "$pack" 2>&1 | tee -a validation_log.txt
+            status=${PIPESTATUS[0]}
+            if [ "$status" -eq 0 ]; then
               echo "OK $name — valid" >> validation_log.txt
             else
-              echo "FAILED $name" >> validation_log.txt
+              echo "FAILED $name (exit $status)" >> validation_log.txt
               failed=$((failed+1))
             fi
           done
           echo "failed=$failed" >> "$GITHUB_OUTPUT"
-          [ "$failed" -gt 0 ] && echo "::warning::$failed pack(s) failed validation."
+          # Use if/fi — avoids bash -e treating a false [ ] as a fatal error
+          if [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed pack(s) failed validation."
+          fi
  
-      - name: "evidence merge — Combine all packs into one archive"
+      - name: "evidence merge"
         id: merge
         run: |
-          packs=(.testmuai/evidence/*.evidence)
+          # Use find + mapfile so the array is truly empty when no files exist.
+          # A bare glob like (.testmuai/evidence/*.evidence) expands to the
+          # literal pattern string when nothing matches, giving a false count of 1.
+          mapfile -d '' -t packs < <(
+            find .testmuai/evidence -maxdepth 1 -name '*.evidence' -print0 2>/dev/null
+          )
           merged=".testmuai/evidence/merged-${{ github.run_id }}.evidence"
-          if [ ${#packs[@]} -gt 1 ]; then
+ 
+          if [ "${#packs[@]}" -gt 1 ]; then
+            echo "Merging ${#packs[@]} packs..."
             kane-cli evidence merge "${packs[@]}" --output "$merged"
             echo "merged_packs=${#packs[@]}" >> "$GITHUB_OUTPUT"
-          elif [ ${#packs[@]} -eq 1 ] && [ -f "${packs[0]}" ]; then
+          elif [ "${#packs[@]}" -eq 1 ]; then
+            echo "Single pack — copying as merged archive."
             cp "${packs[0]}" "$merged"
             echo "merged_packs=1" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::No packs to merge."
+            echo "::warning::No evidence packs found — nothing to merge."
             echo "merged_packs=0" >> "$GITHUB_OUTPUT"
           fi
           echo "merged_path=$merged" >> "$GITHUB_OUTPUT"
@@ -612,13 +784,14 @@ jobs:
         with:
           name: evidence-merged
           path: .testmuai/evidence/merged-${{ github.run_id }}.evidence
+          if-no-files-found: warn
           retention-days: 30
  
       - name: Phase 5 summary
         if: always()
         run: |
           {
-            echo "## Phase 5 — Evidence: The Proof"
+            echo "## Phase 5 — Evidence"
             echo "| Command | Result |"
             echo "|---|---|"
             echo "| \`evidence validate\` | ${{ steps.validate.outputs.failed }} failure(s) |"
@@ -627,7 +800,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
  
   # ══════════════════════════════════════════════════════════════════════════
-  # PHASE 6 — MAINTAIN (only when PRD changes or manual trigger)
+  # PHASE 6 — MAINTAIN
   # ══════════════════════════════════════════════════════════════════════════
   maintain:
     name: "Phase 6 — Maintain: Reconcile Change (PRD-gated)"
@@ -659,15 +832,45 @@ jobs:
  
       - name: Login
         run: |
-          kane-cli login \
-            --username "${{ secrets.KANE_USERNAME }}" \
-            --access-key "${{ secrets.KANE_ACCESS_KEY }}"
+          set -e
+          args=(--username "${{ secrets.KANE_USERNAME }}" --access-key "${{ secrets.KANE_ACCESS_KEY }}")
+          [ -n "$KANE_PROJECT_ID" ] && args+=(--project-id "$KANE_PROJECT_ID")
+          [ -n "$KANE_FOLDER_ID"  ] && args+=(--folder-id  "$KANE_FOLDER_ID")
+          kane-cli login "${args[@]}"
  
-      # FIX 1
       - name: Set project and folder context
         run: |
-          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID"
-          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"
+          [ -n "$KANE_PROJECT_ID" ] && kane-cli config set project-id "$KANE_PROJECT_ID" || true
+          [ -n "$KANE_FOLDER_ID"  ] && kane-cli config set folder-id  "$KANE_FOLDER_ID"  || true
+ 
+      - name: "🔍 Show active project and folder"
+        run: |
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJECT_NAME=$(
+              kane-cli project list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_PROJECT_ID\" or .projectId == \"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || kane-cli project list 2>/dev/null | grep -i "$KANE_PROJECT_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$PROJECT_NAME" ] \
+              && echo "  Project : $PROJECT_NAME  (id: $KANE_PROJECT_ID)" \
+              || echo "  Project ID : $KANE_PROJECT_ID  (name not resolved)"
+          else
+            echo "  Project : <account default>"
+          fi
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLDER_NAME=$(
+              kane-cli folder list --json 2>/dev/null \
+                | jq -r ".[] | select(.id == \"$KANE_FOLDER_ID\" or .folderId == \"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || kane-cli folder list 2>/dev/null | grep -i "$KANE_FOLDER_ID" | head -n1 \
+              || echo ""
+            )
+            [ -n "$FOLDER_NAME" ] \
+              && echo "  Folder  : $FOLDER_NAME  (id: $KANE_FOLDER_ID)" \
+              || echo "  Folder ID : $KANE_FOLDER_ID  (name not resolved)"
+          else
+            echo "  Folder  : <account default>"
+          fi
  
       - name: Show PRD change reason
         run: |
@@ -675,7 +878,7 @@ jobs:
           echo "Triggered by: ${{ github.event_name }}"
           echo "PRD file: ${{ needs.detect-prd-change.outputs.prd_file }}"
  
-      - name: "maintain — Reconcile test suite against current requirements"
+      - name: "maintain"
         run: |
           kane-cli maintain --mode ci 2>&1 | tee maintain_output.txt || \
             echo "::warning::Maintain completed with warnings."
@@ -684,11 +887,10 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Phase 6 — Maintain: Reconcile Change"
+            echo "## Phase 6 — Maintain"
             echo "> **Trigger:** PRD changed = \`${{ needs.detect-prd-change.outputs.prd_changed }}\`"
             echo "> **Event:** \`${{ github.event_name }}\`"
             [ -f maintain_output.txt ] && { echo '```'; cat maintain_output.txt; echo '```'; }
             echo "---"
             echo "### Pipeline Complete"
           } >> "$GITHUB_STEP_SUMMARY"
- 
