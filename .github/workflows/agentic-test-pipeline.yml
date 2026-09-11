@@ -9,8 +9,10 @@ name: Agentic Test Pipeline
 #   Three-layer approach (most → least specific):
 #     a) kane-cli login  receives --project-id / --folder-id            ← sets auth context
 #     b) kane-cli config set  runs after login with the same IDs        ← sets workspace default
-#     c) testmd run / testrun run receive --project-id / --folder-id    ← belt-and-suspenders
-#        (kane-cli design tests does NOT accept these flags — uses config set only)
+#     c) testrun run receives --project-id / --folder-id                ← belt-and-suspenders
+#        kane-cli design tests   — does NOT accept these flags (config set only)
+#        kane-cli testmd run     — does NOT accept these flags (config set only)
+#        kane-cli cover/evidence/maintain — do NOT accept these flags (config set only)
 #   Plus: a "Show active workspace" step prints the project name + folder
 #   name from the CLI so you can confirm in the logs exactly where tests land.
 #
@@ -518,10 +520,30 @@ jobs:
           failed=0
           : > authoring_links.tsv
  
-          proj_args=()
-          [ -n "$KANE_PROJECT_ID" ] && proj_args+=(--project-id "$KANE_PROJECT_ID")
-          [ -n "$KANE_FOLDER_ID"  ] && proj_args+=(--folder-id  "$KANE_FOLDER_ID")
+          # ── Upload destination log ────────────────────────────────────────
+          echo "========================================"
+          echo "📤  Test Manager upload destination"
+          echo "========================================"
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJ_NAME=$(kane-cli project list --json 2>/dev/null \
+              | jq -r ".[] | select(.id==\"$KANE_PROJECT_ID\" or .projectId==\"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || echo "")
+            echo "   Project : ${PROJ_NAME:-<name not resolved>}  (id: $KANE_PROJECT_ID)"
+          else
+            echo "   Project : <account default>"
+          fi
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLD_NAME=$(kane-cli folder list --json 2>/dev/null \
+              | jq -r ".[] | select(.id==\"$KANE_FOLDER_ID\" or .folderId==\"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || echo "")
+            echo "   Folder  : ${FOLD_NAME:-<name not resolved>}  (id: $KANE_FOLDER_ID)"
+          else
+            echo "   Folder  : <account default>"
+          fi
+          echo "========================================"
  
+          # NOTE: kane-cli testmd run does NOT accept --project-id/--folder-id.
+          # Workspace is set via "kane-cli config set" above.
           while IFS= read -r -d '' test_file; do
             echo "--- Running: $test_file"
             test_out=$(mktemp)
@@ -529,8 +551,7 @@ jobs:
               --headless \
               --agent \
               --code-export \
-              --code-language "${{ inputs.test_language }}" \
-              "${proj_args[@]}" | tee "$test_out"
+              --code-language "${{ inputs.test_language }}" | tee "$test_out"
             status=${PIPESTATUS[0]}
             [ "$status" -ne 0 ] && { echo "::warning::Failed: $test_file"; failed=$((failed+1)); }
             share_url=$(grep -o '"share_url":"[^"]*"' "$test_out" | tail -n1 | sed -E 's/.*:"(.*)"/\1/')
@@ -540,12 +561,34 @@ jobs:
           done < selected_tests.txt
           [ "$failed" -gt 0 ] && echo "::warning::$failed test(s) failed."
  
-      # FIX 2: --agent removed; project/folder args passed directly (layer c)
+      # FIX 2: --agent removed; project/folder passed via config set (layer b)
       - name: "testrun run — Bundle all tests into one sealed run"
         env:
           LT_USERNAME: ${{ secrets.LT_USERNAME }}
           LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
         run: |
+          # ── Upload destination log ────────────────────────────────────────
+          echo "========================================"
+          echo "📤  Test run upload destination"
+          echo "========================================"
+          if [ -n "$KANE_PROJECT_ID" ]; then
+            PROJ_NAME=$(kane-cli project list --json 2>/dev/null \
+              | jq -r ".[] | select(.id==\"$KANE_PROJECT_ID\" or .projectId==\"$KANE_PROJECT_ID\") | .name // .projectName // .title" 2>/dev/null \
+              || echo "")
+            echo "   Project : ${PROJ_NAME:-<name not resolved>}  (id: $KANE_PROJECT_ID)"
+          else
+            echo "   Project : <account default>"
+          fi
+          if [ -n "$KANE_FOLDER_ID" ]; then
+            FOLD_NAME=$(kane-cli folder list --json 2>/dev/null \
+              | jq -r ".[] | select(.id==\"$KANE_FOLDER_ID\" or .folderId==\"$KANE_FOLDER_ID\") | .name // .folderName // .title" 2>/dev/null \
+              || echo "")
+            echo "   Folder  : ${FOLD_NAME:-<name not resolved>}  (id: $KANE_FOLDER_ID)"
+          else
+            echo "   Folder  : <account default>"
+          fi
+          echo "========================================"
+ 
           proj_args=()
           [ -n "$KANE_PROJECT_ID" ] && proj_args+=(--project-id "$KANE_PROJECT_ID")
           [ -n "$KANE_FOLDER_ID"  ] && proj_args+=(--folder-id  "$KANE_FOLDER_ID")
