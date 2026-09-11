@@ -9,10 +9,9 @@ name: Agentic Test Pipeline
 #   Three-layer approach (most → least specific):
 #     a) kane-cli login  receives --project-id / --folder-id            ← sets auth context
 #     b) kane-cli config set  runs after login with the same IDs        ← sets workspace default
-#     c) testrun run receives --project-id / --folder-id                ← belt-and-suspenders
-#        kane-cli design tests   — does NOT accept these flags (config set only)
-#        kane-cli testmd run     — does NOT accept these flags (config set only)
-#        kane-cli cover/evidence/maintain — do NOT accept these flags (config set only)
+#     c) NO kane-cli subcommand (other than login) accepts --project-id / --folder-id.
+#        All of: design tests, testmd run, testrun run, cover, evidence validate/merge,
+#        and maintain — rely on config set (layer b) for workspace targeting.
 #   Plus: a "Show active workspace" step prints the project name + folder
 #   name from the CLI so you can confirm in the logs exactly where tests land.
 #
@@ -589,16 +588,13 @@ jobs:
           fi
           echo "========================================"
  
-          proj_args=()
-          [ -n "$KANE_PROJECT_ID" ] && proj_args+=(--project-id "$KANE_PROJECT_ID")
-          [ -n "$KANE_FOLDER_ID"  ] && proj_args+=(--folder-id  "$KANE_FOLDER_ID")
- 
+          # NOTE: kane-cli testrun run does NOT accept --project-id/--folder-id.
+          # Workspace is already set via "kane-cli config set" above.
           mapfile -d '' -t test_files < selected_tests.txt
           kane-cli testrun run "${test_files[@]}" \
             --headless \
             --on-failure continue \
-            --name "agentic-pipeline run ${{ github.run_id }}" \
-            "${proj_args[@]}" | tee testrun_output.ndjson
+            --name "agentic-pipeline run ${{ github.run_id }}" | tee testrun_output.ndjson
  
       - name: Collect evidence packs
         if: always()
@@ -996,3 +992,4 @@ jobs:
             echo "---"
             echo "### Pipeline Complete"
           } >> "$GITHUB_STEP_SUMMARY"
+ 
